@@ -2,6 +2,7 @@
 """Generate tests/openspf_tests.nv from the OpenSPF test suite.
 
     python3 -I tests/gen_openspf.py rfc7208-tests.yml tests/openspf_tests.nv
+    novo fmt tests/openspf_tests.nv
 
 The input is `test/rfc7208-tests.yml` of the pyspf repository, the
 openspf.org test suite release 2014.04, at commit

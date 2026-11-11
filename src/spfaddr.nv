@@ -1,0 +1,279 @@
+// spfaddr.nv — the client address, and the arithmetic SPF does on it.
+//
+// An address is read once, into one struct, and every later question
+// (the `%{i}` macro form, the name a PTR lookup is made at, whether a
+// network contains it) is answered from that struct.  IPv4 is one
+// 32-bit number and IPv6 is two 64-bit halves, which is how ipaddr-nv
+// holds them, so a comparison is a mask and an equality test.
+//
+// AN IPV4-MAPPED IPV6 ADDRESS IS AN IPV4 ADDRESS.  RFC 7208 section 5
+// says an implementation converts `::ffff:192.0.2.1` to `192.0.2.1`
+// before it evaluates a mechanism, because a dual-stack listener sees
+// IPv4 clients under that spelling and the record names them as IPv4.
+
+use ip
+use show
+use spferror
+
+// A client address after parsing.  `v6` selects which fields are meant:
+// `v4` for an IPv4 address, `hi` and `lo` for an IPv6 address.
+pub struct SpfIp
+    v6: Bool
+    v4: Int
+    hi: Int
+    lo: Int
+
+fn v4_value(raw: Int) -> SpfIp
+    SpfIp { v6: false, v4: raw, hi: 0, lo: 0 }
+
+fn v6_value(a: Ipv6) -> SpfIp
+    if a.is_ipv4_mapped()
+        v4_value(a.mapped_ipv4().to_int())
+    else
+        SpfIp { v6: true, v4: 0, hi: a.hi, lo: a.lo }
+
+// Read an IPv4 or IPv6 address.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.1")
+//         Ok(a)  => println("${a.v6}")
+//         Err(_) => println("bad")
+// ```
+pub fn parse_ip(text: Str) -> Result<SpfIp, SpfError> []
+    if str.contains(text, ":")
+        let p = ip.parse_ipv6(text)
+        if p.is_ok()
+            return Ok(v6_value(p.addr))
+        return Err(SpfRequest("`${text}` is not an IPv6 address"))
+    let q = ip.parse_ipv4(text)
+    if q.is_ok()
+        return Ok(v4_value(q.addr.to_int()))
+    Err(SpfRequest("`${text}` is not an IP address"))
+
+// The hexadecimal digit of a nibble, lower case.
+fn nibble_char(n: Int) -> Str
+    str.slice("0123456789abcdef", n, n + 1)
+
+// The 32 nibbles of an IPv6 address, most significant first, each
+// followed by `sep` except the last.
+fn nibbles(a: Ipv6, sep: Str) -> Str
+    var parts: [Str] = []
+    for g in 0..8
+        let v = a.group(g)
+        parts = list.push(parts, nibble_char((v >> 12) & 15))
+        parts = list.push(parts, nibble_char((v >> 8) & 15))
+        parts = list.push(parts, nibble_char((v >> 4) & 15))
+        parts = list.push(parts, nibble_char(v & 15))
+    str.join(parts, sep)
+
+fn v6_of(a: SpfIp) -> Ipv6
+    ip.ipv6_from_halves(a.hi, a.lo)
+
+fn v4_of(a: SpfIp) -> Ipv4
+    ip.ipv4_from_int(a.v4)
+
+// The address as the `%{i}` macro letter writes it: four decimal
+// octets for IPv4, thirty-two dot-separated nibbles for IPv6.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Ok(a)  => println(spfaddr.dotted(a))     // 192.0.2.3
+//         Err(_) => println("bad")
+// ```
+pub fn dotted(a: SpfIp) -> Str []
+    if a.v6
+        nibbles(v6_of(a), ".")
+    else
+        show.addr4(v4_of(a))
+
+// The address as the `%{c}` macro letter writes it: the canonical text
+// of RFC 5952 for IPv6.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("2001:DB8::1")
+//         Ok(a)  => println(spfaddr.pretty(a))     // 2001:db8::1
+//         Err(_) => println("bad")
+// ```
+pub fn pretty(a: SpfIp) -> Str []
+    if a.v6
+        show.addr6(v6_of(a))
+    else
+        show.addr4(v4_of(a))
+
+// The `%{v}` macro letter: `in-addr` for IPv4 and `ip6` for IPv6.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Ok(a)  => println(spfaddr.family(a))     // in-addr
+//         Err(_) => println("bad")
+// ```
+pub fn family(a: SpfIp) -> Str []
+    if a.v6
+        "ip6"
+    else
+        "in-addr"
+
+// The name a PTR lookup of the address is made at: the octets or
+// nibbles reversed, under `in-addr.arpa` or `ip6.arpa`.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Ok(a)  => println(spfaddr.reverse_name(a))   // 3.2.0.192.in-addr.arpa
+//         Err(_) => println("bad")
+// ```
+pub fn reverse_name(a: SpfIp) -> Str []
+    if a.v6
+        let rev = list.rev(str.split(nibbles(v6_of(a), "."), "."))
+        return "${str.join(rev, ".")}.ip6.arpa"
+    let v = v4_of(a)
+    "${v.octet(3)}.${v.octet(2)}.${v.octet(1)}.${v.octet(0)}.in-addr.arpa"
+
+// Whether the top `prefix` bits of two IPv4 numbers agree.
+fn same_prefix4(a: Int, b: Int, prefix: Int) -> Bool
+    if prefix <= 0
+        return true
+    let shift = 32 - prefix
+    let mask = (4294967295 >> shift) << shift
+    (a & mask) == (b & mask)
+
+// Whether the top `prefix` bits of two IPv6 addresses agree.
+fn same_prefix6(a: SpfIp, hi: Int, lo: Int, prefix: Int) -> Bool
+    if prefix <= 0
+        return true
+    if prefix < 64
+        let shift = 64 - prefix
+        let mask = (-1 >> shift) << shift
+        return (a.hi & mask) == (hi & mask)
+    if a.hi != hi
+        return false
+    if prefix == 64
+        return true
+    let shift2 = 128 - prefix
+    let mask2 = (-1 >> shift2) << shift2
+    (a.lo & mask2) == (lo & mask2)
+
+// Whether an address lies in a network of the same family.  `cidr4`
+// applies to an IPv4 client and `cidr6` to an IPv6 client; the network
+// is given as the number (IPv4) or the two halves (IPv6) of an address
+// of the same family as the client, and a network of the other family
+// never contains it.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Ok(a)  => println("${spfaddr.in_net4(a, 3221225984, 24)}")   // true
+//         Err(_) => println("bad")
+// ```
+pub fn in_net4(a: SpfIp, net: Int, prefix: Int) -> Bool []
+    if a.v6
+        return false
+    same_prefix4(a.v4, net, prefix)
+
+// The IPv6 form of `in_net4`.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("2001:db8::1")
+//         Ok(a)  => println("${spfaddr.in_net6(a, 2306139568115548160, 0, 32)}")  // true
+//         Err(_) => println("bad")
+// ```
+pub fn in_net6(a: SpfIp, hi: Int, lo: Int, prefix: Int) -> Bool []
+    if not a.v6
+        return false
+    same_prefix6(a, hi, lo, prefix)
+
+// Whether a lookup answer's address text names the client, under the
+// CIDR lengths of an `a` or `mx` term.  An answer that does not parse
+// as an address of the client's family never matches.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Ok(a)  => println("${spfaddr.matches_text(a, "192.0.2.77", 24, 128)}")   // true
+//         Err(_) => println("bad")
+// ```
+pub fn matches_text(a: SpfIp, text: Str, cidr4: Int, cidr6: Int) -> Bool []
+    match parse_ip(text)
+        Err(_) => false
+        Ok(b)  =>
+            if a.v6 != b.v6
+                false
+            elif a.v6
+                same_prefix6(a, b.hi, b.lo, cidr6)
+            else
+                same_prefix4(a.v4, b.v4, cidr4)
+
+// An IPv4 address in the `ip4` mechanism's grammar: four decimal
+// numbers with no leading zeros, each at most 255.  The answer is the
+// 32-bit number, or -1.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     println("${spfaddr.parse_qnum4("192.0.2.1")}")   // 3221225985
+// ```
+pub fn parse_qnum4(text: Str) -> Int []
+    let parts = str.split(text, ".")
+    if list.len(parts) != 4
+        return -1
+    var raw = 0
+    for p in parts
+        let n = str.len(p)
+        if n == 0 or n > 3
+            return -1
+        if n > 1 and str.byte_at_or(p, 0, 0) == '0'
+            return -1
+        for k in 0..n
+            let c = str.byte_at_or(p, k, 0)
+            if c < '0' or c > '9'
+                return -1
+        let v = str.to_int(p) ?? -1
+        if v < 0 or v > 255
+            return -1
+        raw = raw * 256 + v
+    raw
+
+// An IPv6 address as the `ip6` mechanism writes it, as the two halves
+// in `hi` and `lo`; `ok` is false when the text is not an IPv6 address.
+pub struct SpfNet6
+    ok: Bool
+    hi: Int
+    lo: Int
+
+// Read the address part of an `ip6` term.
+//
+// ```novo
+// use spfaddr
+//
+// fn main() [io]
+//     println("${spfaddr.parse_qnum6("2001:db8::").ok}")   // true
+// ```
+pub fn parse_qnum6(text: Str) -> SpfNet6 []
+    if not str.contains(text, ":")
+        return SpfNet6 { ok: false, hi: 0, lo: 0 }
+    let p = ip.parse_ipv6(text)
+    if not p.is_ok()
+        return SpfNet6 { ok: false, hi: 0, lo: 0 }
+    SpfNet6 { ok: true, hi: p.addr.hi, lo: p.addr.lo }

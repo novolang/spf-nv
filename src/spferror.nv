@@ -1,0 +1,60 @@
+// spferror.nv — the faults a record, a macro or a request can have.
+//
+// A FAULT IS NOT A VERDICT.  RFC 7208 section 2.6 defines seven results,
+// and `spfeval` answers them.  The faults here are what the parsers
+// answer when the text they were given cannot be read at all.  The
+// evaluator turns every one of them into the `permerror` result, because
+// section 4.6 says a record that cannot be parsed ends the check.
+
+// Why a record, a macro string or an address could not be read.
+//
+// ```novo
+// use spferror
+//
+// fn main() [io]
+//     println(spferror.message(SpfSyntax("ip4:300.1.1.1", "not an IPv4 address")))
+// ```
+pub enum SpfError
+    // A term of a record is not in the grammar of section 12.
+    SpfSyntax(term: Str, why: Str)
+    // A macro string is not in the grammar of section 7.1, or uses a
+    // letter its context does not allow.
+    SpfMacro(spec: Str, why: Str)
+    // A request carries an address or a name that cannot be used.
+    SpfRequest(why: Str)
+
+impl Error for SpfError
+    // The refusal as one sentence.
+    fn message(self) -> Str
+        message(self)
+
+// The fault as a sentence, without a full stop.
+//
+// ```novo
+// use spferror
+//
+// fn main() [io]
+//     println(spferror.message(SpfRequest("the client address is empty")))
+// ```
+pub fn message(e: SpfError) -> Str []
+    match e
+        SpfSyntax(term, why) =>
+            "the term `${term}` is not valid: ${why}"
+        SpfMacro(spec, why)  =>
+            "the macro string `${spec}` is not valid: ${why}"
+        SpfRequest(why)      =>
+            why
+
+// A short stable identifier for the fault.
+//
+// ```novo
+// use spferror
+//
+// fn main() [io]
+//     println(spferror.code(SpfRequest("x")))
+// ```
+pub fn code(e: SpfError) -> Str []
+    match e
+        SpfSyntax(_, _) => "syntax"
+        SpfMacro(_, _)  => "macro"
+        SpfRequest(_)   => "request"

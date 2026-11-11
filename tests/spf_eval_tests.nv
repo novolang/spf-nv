@@ -1,0 +1,644 @@
+// spf_eval_tests.nv — the step, its limits, and the two header fields.
+//
+// The OpenSPF suite (openspf_tests.nv) drives the step against zones.
+// These tests drive it against a few answers at a time, so that each
+// path of the evaluation — the question it stops at, the limit it
+// counts, the answer it refuses to use — is named by one assertion.
+// The `Received-SPF` vectors are the three examples of RFC 7208
+// section 9.1.
+
+use std.test
+use spfeval
+use spfheader
+
+fn req(ip: Str, from: Str) -> SpfRequest
+    spfeval.request(ip, from, "mail.example.com", "mx.receiver.example", 1700000000)
+
+fn txt(name: Str, record: Str) -> SpfAnswer
+    spfeval.answer(SpfQTxt, name, [record])
+
+// The check against a fixed table: a question the table does not hold
+// is a name that does not exist.
+fn run(r: SpfRequest, table: [SpfAnswer]) -> SpfVerdict
+    var answers = list.clone(table)
+    for _ in 0..300
+        let out = spfeval.check_host(r, answers)
+        if out.done
+            return out.verdict
+        list.push(answers, spfeval.nxdomain(out.question.qtype, out.question.name))
+    test.fail("the check did not finish")
+    spfeval.check_host(r, answers).verdict
+
+fn result_of(r: SpfRequest, table: [SpfAnswer]) -> Str
+    spfeval.result_name(run(r, table).result)
+
+// The question the step stops at, as `TYPE name`.
+fn waits_for(r: SpfRequest, table: [SpfAnswer]) -> Str
+    let out = spfeval.check_host(r, table)
+    if out.done
+        return "done ${spfeval.result_name(out.verdict.result)}"
+    "${spfeval.qtype_name(out.question.qtype)} ${out.question.name}"
+
+fn includes(n: Int) -> Str
+    var parts: [Str] = ["v=spf1"]
+    for k in 0..n
+        list.push(parts, "include:i${k}.example.org")
+    str.join(parts, " ")
+
+// Ten includes that evaluate to neutral, so that the next term is the
+// eleventh to cause a lookup.
+fn ten_neutral_includes() -> [SpfAnswer]
+    var t: [SpfAnswer] = []
+    for k in 0..10
+        list.push(t, txt("i${k}.example.org", "v=spf1 ?all"))
+    t
+
+fn with_eleventh(term: Str) -> [SpfAnswer]
+    var t = ten_neutral_includes()
+    list.push(t, txt("example.com", "${includes(10)} ${term}"))
+    t
+
+// ── The step ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_step_names_the_question_it_cannot_go_on_without() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("the first question is the sender's domain")
+    test.assert(waits_for(r, []) == "TXT example.com")
+
+    test.case("then each name the record sends it to, in term order")
+    var t = [txt("example.com", "v=spf1 a mx include:other.example.net exists:x.example.org -all")]
+    test.assert(waits_for(r, t) == "A example.com")
+    list.push(t, spfeval.answer(SpfQA, "example.com", ["192.0.2.99"]))
+    test.assert(waits_for(r, t) == "MX example.com")
+    list.push(t, spfeval.answer(SpfQMx, "example.com", ["10 mail.example.com", "20 backup.example.com"]))
+    test.assert(waits_for(r, t) == "A mail.example.com")
+    list.push(t, spfeval.answer(SpfQA, "mail.example.com", ["192.0.2.98"]))
+    test.assert(waits_for(r, t) == "A backup.example.com")
+    list.push(t, spfeval.answer(SpfQA, "backup.example.com", ["192.0.2.97"]))
+    test.assert(waits_for(r, t) == "TXT other.example.net")
+    list.push(t, txt("other.example.net", "v=spf1 -all"))
+    test.assert(waits_for(r, t) == "A x.example.org")
+    list.push(t, spfeval.answer(SpfQA, "x.example.org", ["127.0.0.2"]))
+    test.assert(waits_for(r, t) == "done pass")
+
+    test.case("an IPv6 client asks for AAAA records")
+    let r6 = req("2001:db8::1", "alice@example.com")
+    var t6 = [txt("example.com", "v=spf1 a")]
+    test.assert(waits_for(r6, t6) == "AAAA example.com")
+
+    test.case("a name is compared without case and without its final dot")
+    var t7 = [txt("EXAMPLE.com.", "v=spf1 a")]
+    test.assert(waits_for(r, t7) == "A example.com")
+
+@test
+fn test_a_request_without_a_local_part_or_a_sender_is_postmaster() [io]
+    test.assert(spfeval.request("192.0.2.1", "", "mail.example.com", "me", 0).sender == "postmaster@mail.example.com")
+    var t = [txt("example.com", "v=spf1 exists:%{l}.x.example.org -all")]
+    list.push(t, spfeval.answer(SpfQA, "postmaster.x.example.org", ["127.0.0.2"]))
+    test.assert(result_of(req("192.0.2.1", "@example.com"), t) == "pass")
+    test.assert(result_of(req("192.0.2.1", "example.com"), t) == "pass")
+    test.assert(result_of(req("192.0.2.1", "bob@example.com"), t) == "fail")
+
+@test
+fn test_a_request_with_a_bad_client_address_is_a_permerror() [io]
+    let v = run(req("not-an-ip", "alice@example.com"), [])
+    test.assert(v.result == SpfPermError)
+    test.assert(v.reason == "the client address `not-an-ip` is not an IP address")
+    test.assert(v.domain == "example.com")
+
+@test
+fn test_the_builders_and_the_names() [io]
+    test.assert(spfeval.answer(SpfQA, "a", ["1"]).status == SpfDnsOk)
+    test.assert(spfeval.nxdomain(SpfQA, "a").status == SpfDnsNxDomain)
+    test.assert(spfeval.temp_fail(SpfQA, "a").status == SpfDnsTempFail)
+    test.assert(spfeval.result_name(SpfNone) == "none")
+    test.assert(spfeval.result_name(SpfNeutral) == "neutral")
+    test.assert(spfeval.result_name(SpfPass) == "pass")
+    test.assert(spfeval.result_name(SpfFail) == "fail")
+    test.assert(spfeval.result_name(SpfSoftFail) == "softfail")
+    test.assert(spfeval.result_name(SpfTempError) == "temperror")
+    test.assert(spfeval.result_name(SpfPermError) == "permerror")
+    test.assert(spfeval.qtype_name(SpfQTxt) == "TXT")
+    test.assert(spfeval.qtype_name(SpfQA) == "A")
+    test.assert(spfeval.qtype_name(SpfQAaaa) == "AAAA")
+    test.assert(spfeval.qtype_name(SpfQMx) == "MX")
+    test.assert(spfeval.qtype_name(SpfQPtr) == "PTR")
+
+// ── The limits of section 4.6.4 ──────────────────────────────────────
+
+@test
+fn test_ten_terms_may_cause_lookups_and_the_eleventh_is_a_permerror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("ten includes are fine")
+    var t = ten_neutral_includes()
+    list.push(t, txt("example.com", includes(10)))
+    let ok = run(r, t)
+    test.assert(ok.result == SpfNeutral)
+    test.assert(ok.lookups == 10)
+
+    test.case("an eleventh term of each kind is over the limit")
+    for term in ["include:i10.example.org", "a", "mx", "ptr", "exists:x.example.org"]
+        let v = run(r, with_eleventh(term))
+        test.assert(v.result == SpfPermError)
+        test.assert(v.reason == "more than 10 terms cause lookups")
+
+    test.case("so is a redirect after ten")
+    var t2 = ten_neutral_includes()
+    list.push(t2, txt("example.com", "${includes(10)} redirect=other.example.net"))
+    test.assert(run(r, t2).result == SpfPermError)
+
+@test
+fn test_two_void_lookups_are_allowed_and_the_third_is_a_permerror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    let two = [txt("example.com", "v=spf1 exists:a.example.org exists:b.example.org ?all")]
+    let v2 = run(r, two)
+    test.assert(v2.result == SpfNeutral)
+    test.assert(v2.voids == 2)
+    let three = [txt("example.com", "v=spf1 exists:a.example.org exists:b.example.org exists:c.example.org ?all")]
+    let v3 = run(r, three)
+    test.assert(v3.result == SpfPermError)
+    test.assert(v3.reason == "more than 2 lookups returned no data")
+
+    test.case("a name that cannot be looked up is a void lookup too")
+    let bad = [txt("example.com", "v=spf1 exists:a..example.org ?all")]
+    test.assert(run(r, bad).voids == 1)
+
+    test.case("a name that exists with no data is void")
+    let empty = [txt("example.com", "v=spf1 a ?all"), spfeval.answer(SpfQA, "example.com", [])]
+    test.assert(run(r, empty).voids == 1)
+
+@test
+fn test_an_mx_answer_of_more_than_ten_names_is_a_permerror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    var names: [Str] = []
+    for k in 0..11
+        list.push(names, "${k} mx${k}.example.com")
+    var t = [txt("example.com", "v=spf1 mx -all"), spfeval.answer(SpfQMx, "example.com", names)]
+    test.assert(run(r, t).result == SpfPermError)
+    test.assert(run(r, t).reason == "more than 10 MX names")
+    test.case("ten are fine, and a name without a preference is taken as it is")
+    var t2 = [txt("example.com", "v=spf1 mx -all"),
+              spfeval.answer(SpfQMx, "example.com", ["mx1.example.com"]),
+              spfeval.answer(SpfQA, "mx1.example.com", ["192.0.2.1"])]
+    test.assert(run(r, t2).result == SpfPass)
+
+// ── Errors in the DNS ────────────────────────────────────────────────
+
+@test
+fn test_a_lookup_that_fails_for_a_while_is_a_temperror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("the record's own lookup")
+    let v = run(r, [spfeval.temp_fail(SpfQTxt, "example.com")])
+    test.assert(v.result == SpfTempError)
+    test.assert(v.reason == "the lookup of example.com failed temporarily")
+    test.case("an address lookup, an MX lookup and one made for an MX name")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 a -all"), spfeval.temp_fail(SpfQA, "example.com")]) == "temperror")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 mx -all"), spfeval.temp_fail(SpfQMx, "example.com")]) == "temperror")
+    var t = [txt("example.com", "v=spf1 mx -all"), spfeval.answer(SpfQMx, "example.com", ["m.example.com"]),
+             spfeval.temp_fail(SpfQA, "m.example.com")]
+    test.assert(result_of(r, t) == "temperror")
+    test.case("an include whose record cannot be fetched")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 include:i.example.net -all"),
+                              spfeval.temp_fail(SpfQTxt, "i.example.net")]) == "temperror")
+
+@test
+fn test_an_include_passes_or_does_not_match_and_a_missing_record_is_a_permerror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    let rec = txt("example.com", "v=spf1 include:i.example.net ~all")
+    test.assert(result_of(r, [rec, txt("i.example.net", "v=spf1 +all")]) == "pass")
+    test.assert(result_of(r, [rec, txt("i.example.net", "v=spf1 -all")]) == "softfail")
+    test.assert(result_of(r, [rec, txt("i.example.net", "v=spf1 ~all")]) == "softfail")
+    test.assert(result_of(r, [rec, txt("i.example.net", "v=spf1 ?all")]) == "softfail")
+    test.assert(run(r, [rec]).reason == "i.example.net has no SPF record")
+    test.assert(result_of(r, [rec]) == "permerror")
+    test.assert(result_of(r, [rec, txt("i.example.net", "v=spf1 bogus")]) == "permerror")
+
+@test
+fn test_two_records_or_a_syntax_error_is_a_permerror() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    let two = spfeval.answer(SpfQTxt, "example.com", ["v=spf1 -all", "v=spf1 +all"])
+    let v = run(r, [two])
+    test.assert(v.result == SpfPermError)
+    test.assert(v.reason == "example.com publishes more than one SPF record")
+    test.case("other TXT records are none of the check's business")
+    let mixed = spfeval.answer(SpfQTxt, "example.com", ["google-site-verification=x", "v=spf1 +all"])
+    test.assert(run(r, [mixed]).result == SpfPass)
+    test.case("a syntax error")
+    let bad = run(r, [txt("example.com", "v=spf1 ip4:300.1.1.1 +all")])
+    test.assert(bad.result == SpfPermError)
+    test.assert(str.starts_with(bad.reason, "the term `ip4:300.1.1.1` is not valid"))
+    test.case("no record at all, and a name that cannot be asked about")
+    test.assert(result_of(r, []) == "none")
+    test.assert(result_of(req("192.0.2.1", "alice@a..b"), []) == "none")
+
+// ── The mechanisms ───────────────────────────────────────────────────
+
+@test
+fn test_each_mechanism_matches_the_client_and_names_itself() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("ip4 and ip6")
+    test.assert(run(r, [txt("example.com", "v=spf1 ip4:192.0.2.0/24 -all")]).mechanism == "ip4:192.0.2.0/24")
+    test.assert(result_of(req("2001:db8::7", "a@example.com"), [txt("example.com", "v=spf1 ip6:2001:db8::/32 -all")]) == "pass")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 ip6:2001:db8::/32 -all")]) == "fail")
+    test.case("a with a prefix")
+    let a = [txt("example.com", "v=spf1 a:h.example.org/24 -all"),
+        spfeval.answer(SpfQA, "h.example.org", ["192.0.2.200"])]
+    test.assert(result_of(r, a) == "pass")
+    test.case("an IPv6 client against an AAAA answer")
+    let a6 = [txt("example.com", "v=spf1 a//64 -all"),
+        spfeval.answer(SpfQAaaa, "example.com", ["2001:db8::99"])]
+    test.assert(result_of(req("2001:db8::1", "a@example.com"), a6) == "pass")
+    test.case("mx, and the default when nothing matches")
+    let mx = [txt("example.com", "v=spf1 mx"), spfeval.answer(SpfQMx, "example.com", ["10 m.example.com"]),
+              spfeval.answer(SpfQA, "m.example.com", ["203.0.113.5"])]
+    let v = run(r, mx)
+    test.assert(v.result == SpfNeutral)
+    test.assert(v.mechanism == "default")
+    test.case("exists matches any answer")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 exists:e.example.org -all"),
+                              spfeval.answer(SpfQA, "e.example.org", ["127.0.0.2"])]) == "pass")
+    test.case("all matches everything, with every qualifier")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 all")]) == "pass")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 -all")]) == "fail")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 ~all")]) == "softfail")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 ?all")]) == "neutral")
+
+@test
+fn test_redirect_replaces_the_default_and_the_target_must_have_a_record() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    let rec = txt("example.com", "v=spf1 redirect=_spf.example.net")
+    test.assert(result_of(r, [rec, txt("_spf.example.net", "v=spf1 -all")]) == "fail")
+    test.assert(result_of(r, [rec]) == "permerror")
+    test.assert(run(r, [rec]).reason == "_spf.example.net has no SPF record")
+    test.case("a redirect after an all is never reached")
+    test.assert(result_of(r, [txt("example.com", "v=spf1 -all redirect=_spf.example.net")]) == "fail")
+
+// ── p: the validated domain name ─────────────────────────────────────
+
+fn ptr_table() -> [SpfAnswer]
+    [spfeval.answer(SpfQPtr, "1.2.0.192.in-addr.arpa",
+                    ["host.other.example", "mx.example.com", "spoof.example.com"]),
+     spfeval.answer(SpfQA, "host.other.example", ["192.0.2.1"]),
+     spfeval.answer(SpfQA, "mx.example.com", ["192.0.2.1"]),
+     spfeval.answer(SpfQA, "spoof.example.com", ["192.0.2.66"])]
+
+@test
+fn test_the_ptr_mechanism_and_the_p_letter_use_only_names_that_resolve_back() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("ptr matches a validated name that is the target or below it")
+    var t = ptr_table()
+    list.push(t, txt("example.com", "v=spf1 ptr -all"))
+    test.assert(result_of(r, t) == "pass")
+    var t2 = ptr_table()
+    list.push(t2, txt("example.com", "v=spf1 ptr:example.net -all"))
+    test.assert(result_of(r, t2) == "fail")
+    var t3 = ptr_table()
+    list.push(t3, txt("example.com", "v=spf1 ptr:other.example -all"))
+    test.assert(result_of(r, t3) == "pass")
+
+    test.case("a name that does not resolve back to the client is not validated")
+    var t4 = ptr_table()
+    list.push(t4, txt("example.com", "v=spf1 ptr:spoof.example.com -all"))
+    test.assert(result_of(r, t4) == "fail")
+
+    test.case("%{p} prefers a validated name under the domain, then any, then unknown")
+    var t5 = ptr_table()
+    list.push(t5, txt("example.com", "v=spf1 exists:%{p}.x.example.org -all"))
+    list.push(t5, spfeval.answer(SpfQA, "mx.example.com.x.example.org", ["127.0.0.2"]))
+    test.assert(result_of(r, t5) == "pass")
+    var t6 = ptr_table()
+    list.push(t6, txt("example.net", "v=spf1 exists:%{p}.x.example.org -all"))
+    list.push(t6, spfeval.answer(SpfQA, "host.other.example.x.example.org", ["127.0.0.2"]))
+    test.assert(result_of(req("192.0.2.1", "a@example.net"), t6) == "pass")
+    var t7 = [txt("example.com", "v=spf1 exists:%{p}.x.example.org -all"),
+              spfeval.answer(SpfQA, "unknown.x.example.org", ["127.0.0.2"])]
+    test.assert(result_of(r, t7) == "pass")
+
+    test.case("an error on the reverse lookup or on a forward one skips the name")
+    var t8 = [txt("example.com", "v=spf1 ptr -all"), spfeval.temp_fail(SpfQPtr, "1.2.0.192.in-addr.arpa")]
+    test.assert(result_of(r, t8) == "fail")
+    var t9 = [txt("example.com", "v=spf1 ptr -all"),
+              spfeval.answer(SpfQPtr, "1.2.0.192.in-addr.arpa", ["a.example.com", "b.example.com"]),
+              spfeval.temp_fail(SpfQA, "a.example.com"),
+              spfeval.answer(SpfQA, "b.example.com", ["192.0.2.1"])]
+    test.assert(result_of(r, t9) == "pass")
+
+    test.case("only the first ten names are tried")
+    var many: [Str] = []
+    for k in 0..11
+        list.push(many, "n${k}.example.com")
+    var t10 = [txt("example.com", "v=spf1 ptr -all"), spfeval.answer(SpfQPtr, "1.2.0.192.in-addr.arpa", many),
+               spfeval.answer(SpfQA, "n10.example.com", ["192.0.2.1"])]
+    test.assert(result_of(r, t10) == "fail")
+
+    test.case("an IPv6 client is looked up under ip6.arpa and forward as AAAA")
+    let r6 = req("2001:db8::1", "alice@example.com")
+    let rev = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+    var t11 = [txt("example.com", "v=spf1 ptr -all"), spfeval.answer(SpfQPtr, rev, ["h.example.com"]),
+               spfeval.answer(SpfQAaaa, "h.example.com", ["2001:db8::1"])]
+    test.assert(result_of(r6, t11) == "pass")
+
+@test
+fn test_a_missing_answer_inside_a_domain_spec_is_asked_for() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.case("the PTR lookup %{p} needs, for each term that expands a domain")
+    for term in ["include:%{p}.x.example.org", "exists:%{p}.x.example.org", "a:%{p}.x.example.org",
+                 "mx:%{p}.x.example.org", "ptr:%{p}.x.example.org"]
+        test.assert(waits_for(r, [txt("example.com", "v=spf1 ${term} -all")]) == "PTR 1.2.0.192.in-addr.arpa")
+    test.assert(waits_for(r, [txt("example.com", "v=spf1 redirect=%{p}.x.example.org")]) == "PTR 1.2.0.192.in-addr.arpa")
+
+    test.case("the forward lookup that validates a name")
+    var t = [txt("example.com", "v=spf1 ptr -all"),
+        spfeval.answer(SpfQPtr, "1.2.0.192.in-addr.arpa", ["h.example.com"])]
+    test.assert(waits_for(r, t) == "A h.example.com")
+
+    test.case("the MX lookup, and the name behind a failed one")
+    test.assert(waits_for(r, [txt("example.com", "v=spf1 mx -all")]) == "MX example.com")
+
+// ── Explanations ─────────────────────────────────────────────────────
+
+@test
+fn test_an_explanation_is_fetched_only_for_a_fail_and_expanded_as_an_explanation() [io]
+    let rq = req("192.0.2.1", "alice@example.com")
+    let rec = txt("example.com", "v=spf1 -all exp=why.%{d}")
+    test.case("the question follows the verdict")
+    test.assert(waits_for(rq, [rec]) == "TXT why.example.com")
+
+    test.case("c, r and t are defined in the text")
+    let ok = run(rq, [rec,
+        txt("why.example.com", "%{i} is not allowed to send for %{d}; checked by %{r} at %{t} (%{c})")])
+    test.assert(ok.result == SpfFail)
+    test.assert(ok.explanation == "192.0.2.1 is not allowed to send for example.com; checked by mx.receiver.example at 1700000000 (192.0.2.1)")
+
+    test.case("a lookup that fails, a name that does not exist and two records give no explanation")
+    test.assert(run(rq, [rec, spfeval.temp_fail(SpfQTxt, "why.example.com")]).explanation == "")
+    test.assert(run(rq, [rec]).explanation == "")
+    let two = spfeval.answer(SpfQTxt, "why.example.com", ["one", "two"])
+    test.assert(run(rq, [rec, two]).explanation == "")
+    test.assert(run(rq, [rec, two]).result == SpfFail)
+
+    test.case("text that is not a macro string gives no explanation, and keeps the result")
+    let bad = run(rq, [rec, txt("why.example.com", "%{x}")])
+    test.assert(bad.explanation == "")
+    test.assert(bad.result == SpfFail)
+
+    test.case("a softfail has no explanation, and a record without exp asks nothing")
+    test.assert(waits_for(rq, [txt("example.com", "v=spf1 ~all exp=why.%{d}")]) == "done softfail")
+    test.assert(waits_for(rq, [txt("example.com", "v=spf1 -all")]) == "done fail")
+
+    test.case("the %{p} in the text needs the PTR lookup")
+    let p = [rec, txt("why.example.com", "from %{p}")]
+    test.assert(waits_for(rq, p) == "PTR 1.2.0.192.in-addr.arpa")
+    test.assert(run(rq, p).explanation == "from unknown")
+
+    test.case("the explanation comes from the record that failed, not from an include")
+    let inc = [txt("example.com", "v=spf1 include:i.example.net -all"),
+               txt("i.example.net", "v=spf1 -all exp=inner.example.net"),
+               txt("inner.example.net", "from the include")]
+    test.assert(run(rq, inc).explanation == "")
+    test.case("a redirect's own exp is used")
+    let red = [txt("example.com", "v=spf1 redirect=r.example.net exp=outer.example.net"),
+               txt("r.example.net", "v=spf1 -all exp=inner.example.net"),
+               txt("inner.example.net", "from the redirect"), txt("outer.example.net", "from the original")]
+    test.assert(run(rq, red).explanation == "from the redirect")
+
+// ── The resolver trait ───────────────────────────────────────────────
+
+struct Table
+    rows: [SpfAnswer]
+
+impl SpfResolver[] for Table
+    fn resolve(self, q: SpfQuestion) -> SpfAnswer []
+        for a in self.rows
+            if a.qtype == q.qtype and a.name == q.name
+                return a
+        spfeval.nxdomain(q.qtype, q.name)
+
+// A resolver that answers every question with an answer for another
+// name, so that the check keeps asking.
+struct Deaf
+    n: Int
+
+impl SpfResolver[] for Deaf
+    fn resolve(self, q: SpfQuestion) -> SpfAnswer []
+        spfeval.nxdomain(q.qtype, "elsewhere.example.org")
+
+@test
+fn test_check_with_drives_the_step_through_a_resolver() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    var t = Table { rows: [txt("example.com", "v=spf1 a -all"),
+                           spfeval.answer(SpfQA, "example.com", ["192.0.2.1"])] }
+    test.assert(spfeval.check_with(t, r).result == SpfPass)
+
+    test.case("a resolver that never answers the question asked ends in a permerror")
+    let v = spfeval.check_with(Deaf { n: 0 }, r)
+    test.assert(v.result == SpfPermError)
+    test.assert(v.reason == "the resolver did not answer the questions it was asked")
+
+// ── Received-SPF and Authentication-Results ──────────────────────────
+
+fn verdict(result: SpfResult, mechanism: Str, reason: Str) -> SpfVerdict
+    SpfVerdict { result: result, explanation: "", mechanism: mechanism, reason: reason,
+                 domain: "example.com", lookups: 0, voids: 0 }
+
+@test
+fn test_received_spf_is_written_in_the_form_of_section_9_1() [io]
+    let r = spfeval.request("192.0.2.1", "myname@example.com", "foo.example.com", "mybox.example.org", 0)
+    test.case("the first example of the RFC, with a mechanism")
+    test.assert_eq_str(spfheader.received_spf(verdict(SpfPass, "ip4:192.0.2.1", ""), r, "mailfrom"),
+        "pass (mybox.example.org: domain of myname@example.com designates 192.0.2.1 as permitted sender) receiver=mybox.example.org; client-ip=192.0.2.1; envelope-from=\"myname@example.com\"; helo=foo.example.com; identity=mailfrom; mechanism=ip4:192.0.2.1;")
+
+    test.case("every result has its comment")
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfFail, "-all", ""), r, "mailfrom"),
+        "does not designate 192.0.2.1 as permitted sender"))
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfSoftFail, "~all", ""), r, "mailfrom"),
+        "transitioning domain of myname@example.com"))
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfNeutral, "default", ""), r, "mailfrom"),
+        "is neither permitted nor denied by domain of"))
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfNone, "", ""), r, "mailfrom"),
+        "example.com does not publish an SPF policy"))
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfTempError, "", "the lookup failed"), r, "mailfrom"),
+        "error in processing during lookup of example.com"))
+    test.assert(str.contains(spfheader.received_spf(verdict(SpfPermError, "", "two records"), r, "mailfrom"),
+        "problem=\"two records\";"))
+
+    test.case("the HELO identity has no envelope-from")
+    let h = spfheader.received_spf(verdict(SpfPass, "a", ""), r, "helo")
+    test.assert(str.contains(h, "envelope-from") == false)
+    test.assert(str.contains(h, "identity=helo;"))
+
+    test.case("nothing the sender controls reaches the field unescaped")
+    let evil = spfeval.request("192.0.2.1", "a\"b\\c(d)\r\n@example.com", "h\x01h", "mb(x)", 0)
+    let line = spfheader.received_spf(verdict(SpfPass, "a", ""), evil, "mailfrom")
+    test.assert(str.contains(line, "envelope-from=\"a\\\"b\\\\c(d)  @example.com\";"))
+    test.assert(str.contains(line, "helo=\"h h\";"))
+    test.assert(str.contains(line, "(mb?x?: "))
+    test.assert(str.contains(line, "\r") == false and str.contains(line, "\n") == false)
+
+@test
+fn test_received_spf_is_read_back_from_the_rfcs_three_examples() [io]
+    test.case("example 1, folded")
+    let one = "pass (mybox.example.org: domain of\r\n myname@example.com designates 192.0.2.1 as permitted sender)\r\n       receiver=mybox.example.org; client-ip=192.0.2.1;\r\n       envelope-from=\"myname@example.com\"; helo=foo.example.com;"
+    match spfheader.parse_received_spf(one)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.result == SpfPass)
+            test.assert(p.comment == "mybox.example.org: domain of myname@example.com designates 192.0.2.1 as permitted sender")
+            test.assert(spfheader.received_value(p, "receiver") == Some("mybox.example.org"))
+            test.assert(spfheader.received_value(p, "CLIENT-IP") == Some("192.0.2.1"))
+            test.assert(spfheader.received_value(p, "envelope-from") == Some("myname@example.com"))
+            test.assert(spfheader.received_value(p, "helo") == Some("foo.example.com"))
+            test.assert(spfheader.received_value(p, "mechanism") == None)
+
+    test.case("example 2, the fail")
+    let two = "fail (mybox.example.org: domain of\r\n                     myname@example.com does not designate\r\n                     192.0.2.1 as permitted sender)\r\n                     identity=mailfrom; client-ip=192.0.2.1;\r\n                     envelope-from=\"myname@example.com\";"
+    match spfheader.parse_received_spf(two)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.result == SpfFail)
+            test.assert(spfheader.received_value(p, "identity") == Some("mailfrom"))
+
+    test.case("example 3, with a mechanism")
+    let three = "pass (mybox.example.org: domain of\r\n myname@example.com designates 192.0.2.1 as permitted sender)\r\n       receiver=mybox.example.org; client-ip=192.0.2.1;\r\n       mechanism=ip4:192.0.2.1; envelope-from=\"myname@example.com\";\r\n       helo=foo.example.com;"
+    match spfheader.parse_received_spf(three)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(spfheader.received_value(p, "mechanism") == Some("ip4:192.0.2.1"))
+            test.assert(list.len(p.keys) == 5)
+
+    test.case("what the writer writes the reader reads")
+    let r = spfeval.request("192.0.2.1", "myname@example.com", "foo.example.com", "mybox.example.org", 0)
+    match spfheader.parse_received_spf(spfheader.received_spf(verdict(SpfSoftFail, "~all", ""), r, "mailfrom"))
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.result == SpfSoftFail)
+            test.assert(spfheader.received_value(p, "envelope-from") == Some("myname@example.com"))
+
+@test
+fn test_received_spf_that_cannot_be_read_is_refused() [io]
+    match spfheader.parse_received_spf("bogus")
+        Err(e) => test.assert(e.message() == "`bogus` is not an SPF result")
+        Ok(_)  => test.fail("bogus is not a result")
+    match spfheader.parse_received_spf("pass (never closed")
+        Err(e) => test.assert(e.message() == "the comment is never closed")
+        Ok(_)  => test.fail("an open comment")
+    match spfheader.parse_received_spf("pass client-ip")
+        Err(e) => test.assert(e.message() == "a key-value pair has no `=`")
+        Ok(_)  => test.fail("a pair needs =")
+    match spfheader.parse_received_spf("pass two words=x")
+        Err(e) => test.assert(e.message() == "`two words` is not a key")
+        Ok(_)  => test.fail("a key is one word")
+    match spfheader.parse_received_spf("pass =x")
+        Err(e) => test.assert(e.message() == "`` is not a key")
+        Ok(_)  => test.fail("a key is not empty")
+    match spfheader.parse_received_spf("pass a;b=x")
+        Err(e) => test.assert(e.message() == "`a;b` is not a key")
+        Ok(_)  => test.fail("a key holds no semicolon")
+    match spfheader.parse_received_spf("pass helo=\"never closed")
+        Err(e) => test.assert(e.message() == "the quoted value of `helo` is never closed")
+        Ok(_)  => test.fail("an open quote")
+
+@test
+fn test_a_comment_may_nest_and_escape() [io]
+    match spfheader.parse_received_spf("Pass (a (b) \\) c) helo=x")
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.result == SpfPass)
+            test.assert(p.comment == "a (b) ) c")
+    match spfheader.parse_received_spf("pass helo=\"a\\\"b\"; ; client-ip=1.2.3.4")
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(spfheader.received_value(p, "helo") == Some("a\"b"))
+            test.assert(spfheader.received_value(p, "client-ip") == Some("1.2.3.4"))
+
+@test
+fn test_authentication_results_for_the_spf_method() [io]
+    let r = spfeval.request("192.0.2.1", "alice@example.com", "mail.example.com", "mx", 0)
+    test.assert(spfheader.authentication_results(verdict(SpfPass, "a", ""), r)
+        == "spf=pass smtp.mailfrom=alice@example.com smtp.helo=mail.example.com")
+    test.assert(spfheader.authentication_results(verdict(SpfPermError, "", "two records"), r)
+        == "spf=permerror reason=\"two records\" smtp.mailfrom=alice@example.com smtp.helo=mail.example.com")
+    let nohelo = spfeval.request("192.0.2.1", "alice@example.com", "", "mx", 0)
+    test.assert(spfheader.authentication_results(verdict(SpfFail, "-all", ""), nohelo)
+        == "spf=fail smtp.mailfrom=alice@example.com")
+
+    test.case("a method result is read back")
+    match spfheader.parse_authentication_results("SPF=pass (domain ok) reason=\"fine\" smtp.mailfrom=alice@example.com (sender) smtp.helo=mail.example.com")
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.result == SpfPass)
+            test.assert(p.comment == "domain ok")
+            test.assert(p.reason == "fine")
+            test.assert(spfheader.auth_value(p, "smtp.mailfrom") == Some("alice@example.com"))
+            test.assert(spfheader.auth_value(p, "SMTP.HELO") == Some("mail.example.com"))
+            test.assert(spfheader.auth_value(p, "smtp.other") == None)
+    match spfheader.parse_authentication_results(spfheader.authentication_results(verdict(SpfSoftFail, "~all", ""), r))
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert(p.result == SpfSoftFail)
+    match spfheader.parse_authentication_results("spf=none; dkim=pass")
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert(list.len(p.keys) == 0)
+
+    test.case("what it refuses")
+    match spfheader.parse_authentication_results("dkim=pass")
+        Err(e) => test.assert(e.message() == "the method is not `spf`")
+        Ok(_)  => test.fail("dkim is not spf")
+    match spfheader.parse_authentication_results("spf=bogus")
+        Err(e) => test.assert(e.message() == "`bogus` is not an SPF result")
+        Ok(_)  => test.fail("bogus")
+    match spfheader.parse_authentication_results("spf=pass (open")
+        Err(e) => test.assert(e.message() == "the comment is never closed")
+        Ok(_)  => test.fail("open comment")
+    match spfheader.parse_authentication_results("spf=pass smtp.helo")
+        Err(e) => test.assert(e.message() == "a property has no `=`")
+        Ok(_)  => test.fail("no =")
+    match spfheader.parse_authentication_results("spf=pass smtp.helo=\"open")
+        Err(e) => test.assert(e.message() == "the quoted value of `smtp.helo` is never closed")
+        Ok(_)  => test.fail("open quote")
+    match spfheader.parse_authentication_results("spf=pass smtp.helo=x (open")
+        Err(e) => test.assert(e.message() == "the comment is never closed")
+        Ok(_)  => test.fail("open comment after a property")
+
+@test
+fn test_values_that_are_not_atoms_are_quoted_and_every_result_is_read() [io]
+    let v = verdict(SpfPass, "a", "")
+    test.case("an empty value, a leading dot, a trailing dot and a double dot")
+    let r1 = spfeval.request("192.0.2.1", "a@example.com", "", "me", 0)
+    test.assert(str.contains(spfheader.received_spf(v, r1, "mailfrom"), "helo=\"\";"))
+    let r2 = spfeval.request("192.0.2.1", "a@example.com", ".x", "me", 0)
+    test.assert(str.contains(spfheader.received_spf(v, r2, "mailfrom"), "helo=\".x\";"))
+    let r3 = spfeval.request("192.0.2.1", "a@example.com", "x.", "me", 0)
+    test.assert(str.contains(spfheader.received_spf(v, r3, "mailfrom"), "helo=\"x.\";"))
+    let r4 = spfeval.request("192.0.2.1", "a@example.com", "a..b", "me", 0)
+    test.assert(str.contains(spfheader.received_spf(v, r4, "mailfrom"), "helo=\"a..b\";"))
+
+    test.case("an Authentication-Results value that is not an address is quoted")
+    let r5 = spfeval.request("192.0.2.1", "a b@example.com", "h", "me", 0)
+    test.assert(str.contains(spfheader.authentication_results(v, r5), "smtp.mailfrom=\"a b@example.com\""))
+    let r6 = spfeval.request("192.0.2.1", "@example.com", "h", "me", 0)
+    test.assert(str.contains(spfheader.authentication_results(v, r6), "smtp.mailfrom=@example.com"))
+    let r7 = spfeval.request("192.0.2.1", "a@b c", "h", "me", 0)
+    test.assert(str.contains(spfheader.authentication_results(v, r7), "smtp.mailfrom=\"a@b c\""))
+
+    test.case("neutral, temperror and permerror are results too")
+    match spfheader.parse_received_spf("neutral")
+        Ok(p)  => test.assert(p.result == SpfNeutral)
+        Err(e) => test.fail(e.message())
+    match spfheader.parse_received_spf("temperror")
+        Ok(p)  => test.assert(p.result == SpfTempError)
+        Err(e) => test.fail(e.message())
+    match spfheader.parse_received_spf("permerror")
+        Ok(p)  => test.assert(p.result == SpfPermError)
+        Err(e) => test.fail(e.message())
+    match spfheader.parse_received_spf("softfail")
+        Ok(p)  => test.assert(p.result == SpfSoftFail)
+        Err(e) => test.fail(e.message())
+    match spfheader.parse_received_spf("none")
+        Ok(p)  => test.assert(p.result == SpfNone)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_exp_domain_that_needs_a_lookup_is_asked_for() [io]
+    let r = req("192.0.2.1", "alice@example.com")
+    test.assert(waits_for(r, [txt("example.com", "v=spf1 -all exp=%{p}.x.example.org")]) == "PTR 1.2.0.192.in-addr.arpa")

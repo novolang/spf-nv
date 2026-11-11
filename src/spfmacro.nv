@@ -1,0 +1,353 @@
+// spfmacro.nv — the macro strings of RFC 7208 section 7.
+//
+// A domain-spec in a record is not a domain name but a template for one:
+// `exists:%{ir}.%{l1r+-}._spf.%{d2}` becomes a different name for every
+// client and sender.  This module checks a template against the grammar
+// of section 7.1 and expands it against what the check knows about the
+// message.
+//
+// EXPANSION IS TOTAL EXCEPT FOR THREE LETTERS.  `s`, `l`, `o`, `d`, `i`,
+// `h`, `v` and `p` are always defined.  `c`, `r` and `t` are defined
+// only in the explanation string of an `exp` modifier (section 7.2),
+// and the grammar accepts them everywhere, so the refusal is made at
+// expansion and names the letter.
+//
+// `p` NEEDS THE DNS.  The validated domain name of the client is found
+// by a PTR lookup and the forward lookups that confirm it.  This module
+// does not look anything up: the evaluator in `spfeval` finds the name
+// first and passes it in `validated`, and "unknown" when there is none.
+
+use spfaddr
+use spferror
+
+// What the macro letters stand for.
+pub struct SpfMacroEnv
+    // The local part of the sender: the `%{l}` letter.
+    local: Str
+    // The domain of the sender: the `%{o}` letter.
+    sender_domain: Str
+    // The HELO or EHLO name: the `%{h}` letter.
+    helo: Str
+    // The domain the record being evaluated belongs to: `%{d}`.
+    domain: Str
+    // The SMTP client address: `%{i}`, `%{c}` and `%{v}`.
+    client: SpfIp
+    // The validated domain name of the client: `%{p}`.
+    validated: Str
+    // The name of the receiving host: `%{r}`.
+    receiver: Str
+    // Seconds since the epoch: `%{t}`.
+    now: Int
+
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+fn is_alpha(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+fn is_letter(b: Int) -> Bool
+    let l = b | 32
+    l == 's' or l == 'l' or l == 'o' or l == 'd' or l == 'i' or l == 'p'
+        or l == 'h' or l == 'c' or l == 'r' or l == 't' or l == 'v'
+
+fn is_delimiter(b: Int) -> Bool
+    b == '.' or b == '-' or b == '+' or b == ',' or b == '/' or b == '_' or b == '='
+
+// The position just past the `}` that closes the macro whose `%` is at
+// `at`, or -1 when the text is not a macro-expand.
+fn macro_end(spec: Str, at: Int) -> Int
+    let n = str.len(spec)
+    let second = str.byte_at_or(spec, at + 1, 0)
+    if second == '%' or second == '_' or second == '-'
+        return at + 2
+    if second != '{'
+        return -1
+    if at + 2 >= n or not is_letter(str.byte_at_or(spec, at + 2, 0))
+        return -1
+    var i = at + 3
+    while i < n and is_digit(str.byte_at_or(spec, i, 0))
+        i += 1
+    if i < n and (str.byte_at_or(spec, i, 0) | 32) == 'r'
+        i += 1
+    while i < n and is_delimiter(str.byte_at_or(spec, i, 0))
+        i += 1
+    if i < n and str.byte_at_or(spec, i, 0) == '}'
+        return i + 1
+    -1
+
+// Check a macro string against section 7.1.  `explanation` is true for
+// the text of an explanation, which may hold spaces and may use the
+// letters `c`, `r` and `t`, and false for a domain-spec, which may do
+// neither.
+//
+// ```novo
+// use spfmacro
+//
+// fn main() [io]
+//     match spfmacro.check("%{ir}.%{v}._spf.%{d2}", false)
+//         Ok(_)  => println("valid")
+//         Err(e) => println(e.message())
+// ```
+pub fn check(spec: Str, explanation: Bool) -> Result<Unit, SpfError> []
+    var i = 0
+    let n = str.len(spec)
+    while i < n
+        let b = str.byte_at_or(spec, i, 0)
+        if b == '%'
+            let e = macro_end(spec, i)
+            if e < 0
+                return Err(SpfMacro(spec, "a `%` must begin `%%`, `%_`, `%-` or `%{`"))
+            let letter = str.byte_at_or(spec, i + 2, 0) | 32
+            if str.byte_at_or(spec, i + 1, 0) == '{' and not explanation
+                    and (letter == 'c' or letter == 'r' or letter == 't')
+                return Err(SpfMacro(spec, "the letter `${str.from_byte(letter)}` is defined only in an explanation"))
+            var digits = 0
+            var j = i + 3
+            while str.byte_at_or(spec, i + 1, 0) == '{' and is_digit(str.byte_at_or(spec, j, 0))
+                digits = digits * 10 + (str.byte_at_or(spec, j, 0) - '0')
+                j += 1
+            if j > i + 3 and digits == 0
+                return Err(SpfMacro(spec, "a transformer of zero parts is not allowed"))
+            i = e
+        elif b == ' ' and explanation
+            i += 1
+        elif b < 33 or b > 126
+            return Err(SpfMacro(spec, "a macro string holds only visible characters"))
+        else
+            i += 1
+    Ok(())
+
+// Whether the last label of a name is a toplabel (section 12): not all
+// digits, letters, digits and hyphens, no hyphen at either end.
+fn is_toplabel(label: Str) -> Bool
+    let n = str.len(label)
+    if n == 0
+        return false
+    var alpha = false
+    for k in 0..n
+        let b = str.byte_at_or(label, k, 0)
+        if is_alpha(b)
+            alpha = true
+        elif not is_digit(b) and b != '-'
+            return false
+    let first = str.byte_at_or(label, 0, 0)
+    let last = str.byte_at_or(label, n - 1, 0)
+    alpha and first != '-' and last != '-'
+
+// Whether a domain-spec ends the way section 12 requires: a toplabel
+// after a dot (with an optional trailing dot), or a macro.
+//
+// ```novo
+// use spfmacro
+//
+// fn main() [io]
+//     println("${spfmacro.domain_end_ok("example.com.")}")   // true
+// ```
+pub fn domain_end_ok(spec: Str) -> Bool []
+    let n = str.len(spec)
+    if n == 0
+        return false
+    let last = str.byte_at_or(spec, n - 1, 0)
+    if last == '}'
+        return true
+    var body = spec
+    if last == '.'
+        body = str.slice(spec, 0, n - 1)
+    let parts = str.split(body, ".")
+    list.len(parts) >= 2 and is_toplabel(parts[list.len(parts) - 1])
+
+// One byte as `%XX`, upper case.
+fn percent(b: Int) -> Str
+    let digits = "0123456789ABCDEF"
+    "%${str.slice(digits, (b >> 4) & 15, ((b >> 4) & 15) + 1)}${str.slice(digits, b & 15, (b & 15) + 1)}"
+
+// URL-escape a macro value (section 7.3): the unreserved characters of
+// RFC 3986 stay, every other octet becomes `%XX`.
+//
+// ```novo
+// use spfmacro
+//
+// fn main() [io]
+//     println(spfmacro.url_escape("a b@c"))   // a%20b%40c
+// ```
+pub fn url_escape(s: Str) -> Str []
+    var parts: [Str] = []
+    for k in 0..str.len(s)
+        let b = str.byte_at_or(s, k, 0)
+        if is_alpha(b) or is_digit(b) or b == '-' or b == '.' or b == '_' or b == '~'
+            parts = list.push(parts, str.from_byte(b))
+        else
+            parts = list.push(parts, percent(b))
+    str.join(parts, "")
+
+// Cut `value` at every delimiter byte named in `delims`.
+fn split_on(value: Str, delims: Str) -> [Str]
+    var out: [Str] = []
+    var start = 0
+    for k in 0..str.len(value)
+        if str.contains(delims, str.from_byte(str.byte_at_or(value, k, 0)))
+            out = list.push(out, str.slice(value, start, k))
+            start = k + 1
+    out = list.push(out, str.slice(value, start, str.len(value)))
+    out
+
+// Apply the transformers of one macro: split at the delimiters, reverse
+// if asked, keep the right-most `keep` parts, join with dots.
+fn transform(value: Str, keep: Int, reverse: Bool, delims: Str) -> Str
+    var parts = split_on(value, delims)
+    if reverse
+        parts = list.rev(parts)
+    if keep > 0 and keep < list.len(parts)
+        parts = list.slice(parts, list.len(parts) - keep, list.len(parts))
+    str.join(parts, ".")
+
+// The value of one macro letter.
+fn letter_value(l: Int, ctx: SpfMacroEnv) -> Str
+    if l == 's'
+        "${ctx.local}@${ctx.sender_domain}"
+    elif l == 'l'
+        ctx.local
+    elif l == 'o'
+        ctx.sender_domain
+    elif l == 'd'
+        ctx.domain
+    elif l == 'i'
+        spfaddr.dotted(ctx.client)
+    elif l == 'p'
+        ctx.validated
+    elif l == 'v'
+        spfaddr.family(ctx.client)
+    elif l == 'h'
+        ctx.helo
+    elif l == 'c'
+        spfaddr.pretty(ctx.client)
+    elif l == 'r'
+        ctx.receiver
+    else
+        str.from_int(ctx.now)
+
+// Whether a template holds the `%{p}` letter, so that the evaluator
+// knows to find the validated domain name before it expands.
+//
+// ```novo
+// use spfmacro
+//
+// fn main() [io]
+//     println("${spfmacro.uses_p("%{p}.example.com")}")   // true
+// ```
+pub fn uses_p(spec: Str) -> Bool []
+    var i = 0
+    let n = str.len(spec)
+    while i < n
+        if str.byte_at_or(spec, i, 0) == '%'
+            let e = macro_end(spec, i)
+            if e < 0
+                return false
+            if str.byte_at_or(spec, i + 1, 0) == '{' and (str.byte_at_or(spec, i + 2, 0) | 32) == 'p'
+                return true
+            i = e
+        else
+            i += 1
+    false
+
+// Expand a macro string.  `exp` is true when the string is the text of
+// an explanation, which is the only place `c`, `r` and `t` are defined.
+//
+// ```novo
+// use spfmacro
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Err(_) => println("bad")
+//         Ok(a)  =>
+//             let ctx = SpfMacroEnv { local: "strong-bad", sender_domain: "email.example.com",
+//                                     helo: "mx.example.org", domain: "email.example.com",
+//                                     client: a, validated: "unknown",
+//                                     receiver: "unknown", now: 0 }
+//             match spfmacro.expand("%{ir}.%{v}._spf.%{d2}", ctx, false)
+//                 Ok(s)  => println(s)     // 3.2.0.192.in-addr._spf.example.com
+//                 Err(e) => println(e.message())
+// ```
+pub fn expand(spec: Str, ctx: SpfMacroEnv, exp: Bool) -> Result<Str, SpfError> []
+    match check(spec, exp)
+        Err(e) => Err(e)
+        Ok(_)  => Ok(expand_checked(spec, ctx))
+
+// Expand a macro string that `check` has already accepted.  The answer
+// is total: a record's domain-specs are checked when the record is
+// parsed, so the evaluation expands them without a second refusal to
+// handle.  The result for a string `check` would refuse is not defined.
+//
+// ```novo
+// use spfmacro
+// use spfaddr
+//
+// fn main() [io]
+//     match spfaddr.parse_ip("192.0.2.3")
+//         Err(_) => println("bad")
+//         Ok(a)  =>
+//             let ctx = SpfMacroEnv { local: "l", sender_domain: "example.com", helo: "h",
+//                                     domain: "example.com", client: a, validated: "unknown",
+//                                     receiver: "unknown", now: 0 }
+//             println(spfmacro.expand_checked("%{d}", ctx))    // example.com
+// ```
+pub fn expand_checked(spec: Str, ctx: SpfMacroEnv) -> Str []
+    var out: [Str] = []
+    var i = 0
+    let n = str.len(spec)
+    while i < n
+        let b = str.byte_at_or(spec, i, 0)
+        if b != '%'
+            out = list.push(out, str.from_byte(b))
+            i += 1
+        else
+            let e = macro_end(spec, i)
+            let second = str.byte_at_or(spec, i + 1, 0)
+            if second == '%'
+                out = list.push(out, "%")
+            elif second == '_'
+                out = list.push(out, " ")
+            elif second == '-'
+                out = list.push(out, "%20")
+            else
+                let letter = str.byte_at_or(spec, i + 2, 0)
+                let lower = letter | 32
+                var j = i + 3
+                var keep = 0
+                while is_digit(str.byte_at_or(spec, j, 0))
+                    keep = keep * 10 + (str.byte_at_or(spec, j, 0) - '0')
+                    j += 1
+                var reverse = false
+                if (str.byte_at_or(spec, j, 0) | 32) == 'r'
+                    reverse = true
+                    j += 1
+                let delims = str.slice(spec, j, e - 1)
+                var delimiters = "."
+                if str.len(delims) > 0
+                    delimiters = delims
+                var text = transform(letter_value(lower, ctx), keep, reverse, delimiters)
+                if letter < 'a'
+                    text = url_escape(text)
+                out = list.push(out, text)
+            i = e
+    str.join(out, "")
+
+// Cut a name to 253 octets by removing labels from the left, as section
+// 7.3 requires of an expanded domain-spec.
+//
+// ```novo
+// use spfmacro
+//
+// fn main() [io]
+//     println(spfmacro.fit_domain("a.b.c"))   // a.b.c
+// ```
+pub fn fit_domain(name: Str) -> Str []
+    var s = name
+    while str.len(s) > 253
+        match str.index(s, ".")
+            None    =>
+                return str.slice(s, str.len(s) - 253, str.len(s))
+            Some(k) =>
+                s = str.slice(s, k + 1, str.len(s))
+    s

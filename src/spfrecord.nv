@@ -1,0 +1,434 @@
+// spfrecord.nv — the record of RFC 7208 section 12, parsed.
+//
+// A record is `v=spf1` followed by terms, and a term is a directive (a
+// mechanism with a qualifier) or a modifier.  The whole record is read
+// before any of it is evaluated, because section 4.6 says a syntax error
+// anywhere in a record is a `permerror` even when an earlier mechanism
+// would have matched.
+//
+// UNKNOWN MODIFIERS ARE IGNORED, AND UNKNOWN MECHANISMS ARE NOT.  A
+// term of the form `name=macro-string` that is neither `redirect` nor
+// `exp` is skipped (section 6), which is what lets the language grow
+// new modifiers.  A term that is not a modifier and whose name is not
+// one of the eight mechanisms is a syntax error, because a verifier
+// that skipped it could pass a message the publisher meant to refuse.
+
+use spfaddr
+use spferror
+use spfmacro
+
+// The qualifier of a directive: what a match means (section 4.6.2).
+pub enum SpfQualifier
+    SpfPlus
+    SpfMinus
+    SpfTilde
+    SpfQuestion
+
+// The eight mechanisms of section 5.
+pub enum SpfKind
+    SpfAll
+    SpfInclude
+    SpfA
+    SpfMx
+    SpfPtr
+    SpfIp4
+    SpfIp6
+    SpfExists
+
+// One directive.  `spec` is the unexpanded domain-spec, or empty when
+// the term names none (the current domain is meant).  `cidr4` and
+// `cidr6` are the dual CIDR lengths of `a` and `mx` and the prefix of
+// `ip4` and `ip6`; they default to 32 and 128.  `hi` and `lo` hold the
+// network of `ip4` (in `lo`) and `ip6`.  `text` is the term as written,
+// for the `mechanism` field of a verdict.
+pub struct SpfTerm
+    kind: SpfKind
+    qualifier: SpfQualifier
+    var spec: Str
+    var cidr4: Int
+    var cidr6: Int
+    var hi: Int
+    var lo: Int
+    text: Str
+
+// A parsed record.  `redirect` and `exp` are the unexpanded
+// domain-specs of the two modifiers, with `has_redirect` and `has_exp`
+// saying whether they were present.
+pub struct SpfRecord
+    var terms: [SpfTerm]
+    var has_redirect: Bool
+    var redirect: Str
+    var has_exp: Bool
+    var exp: Str
+
+// Whether a TXT string is an SPF record: `v=spf1` in any case,
+// followed by a space or the end (section 4.5).
+//
+// ```novo
+// use spfrecord
+//
+// fn main() [io]
+//     println("${spfrecord.is_spf("v=spf1 -all")}")   // true
+// ```
+pub fn is_spf(txt: Str) -> Bool []
+    let n = str.len(txt)
+    if n < 6
+        return false
+    if str.lower(str.slice(txt, 0, 6)) != "v=spf1"
+        return false
+    n == 6 or str.byte_at_or(txt, 6, 0) == ' '
+
+// The qualifier a character stands for, or None.
+fn qualifier_of(b: Int) -> ?SpfQualifier
+    if b == '+'
+        Some(SpfPlus)
+    elif b == '-'
+        Some(SpfMinus)
+    elif b == '~'
+        Some(SpfTilde)
+    elif b == '?'
+        Some(SpfQuestion)
+    else
+        None
+
+// The qualifier's character.
+//
+// ```novo
+// use spfrecord
+//
+// fn main() [io]
+//     println(spfrecord.qualifier_char(SpfTilde))   // ~
+// ```
+pub fn qualifier_char(q: SpfQualifier) -> Str []
+    match q
+        SpfPlus     => "+"
+        SpfMinus    => "-"
+        SpfTilde    => "~"
+        SpfQuestion => "?"
+
+// The mechanism's name.
+//
+// ```novo
+// use spfrecord
+//
+// fn main() [io]
+//     println(spfrecord.kind_name(SpfIp4))   // ip4
+// ```
+pub fn kind_name(k: SpfKind) -> Str []
+    match k
+        SpfAll     => "all"
+        SpfInclude => "include"
+        SpfA       => "a"
+        SpfMx      => "mx"
+        SpfPtr     => "ptr"
+        SpfIp4     => "ip4"
+        SpfIp6     => "ip6"
+        SpfExists  => "exists"
+
+fn kind_of(name: Str) -> ?SpfKind
+    if name == "all"
+        Some(SpfAll)
+    elif name == "include"
+        Some(SpfInclude)
+    elif name == "a"
+        Some(SpfA)
+    elif name == "mx"
+        Some(SpfMx)
+    elif name == "ptr"
+        Some(SpfPtr)
+    elif name == "ip4"
+        Some(SpfIp4)
+    elif name == "ip6"
+        Some(SpfIp6)
+    elif name == "exists"
+        Some(SpfExists)
+    else
+        None
+
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+fn is_alpha(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z'
+
+// A modifier name: ALPHA *( ALPHA / DIGIT / "-" / "_" / "." ).
+fn is_modifier_name(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0 or not is_alpha(str.byte_at_or(s, 0, 0))
+        return false
+    for k in 1..n
+        let b = str.byte_at_or(s, k, 0)
+        if not is_alpha(b) and not is_digit(b) and b != '-' and b != '_' and b != '.'
+            return false
+    true
+
+// A CIDR length with no sign, no leading zero and a value at most
+// `limit`: the answer, or -1.
+fn parse_length(text: Str, limit: Int) -> Int
+    let n = str.len(text)
+    if n == 0 or n > 3
+        return -1
+    if n > 1 and str.byte_at_or(text, 0, 0) == '0'
+        return -1
+    for k in 0..n
+        if not is_digit(str.byte_at_or(text, k, 0))
+            return -1
+    let v = str.to_int(text) ?? -1
+    if v > limit
+        return -1
+    v
+
+// The two lengths a dual-cidr-length may carry.
+struct Dual
+    ok: Bool
+    cidr4: Int
+    cidr6: Int
+
+// Read the CIDR lengths in `rest`, which is empty or begins with a
+// slash (what follows a domain-spec or the mechanism name).  The forms
+// are `/n`, `//m` and `/n//m`.
+fn split_dual(rest: Str) -> Dual
+    match str.index(rest, "//")
+        Some(k) =>
+            let six = parse_length(str.slice(rest, k + 2, str.len(rest)), 128)
+            if six < 0
+                return Dual { ok: false, cidr4: 32, cidr6: 128 }
+            let head = str.slice(rest, 0, k)
+            if str.len(head) == 0
+                return Dual { ok: true, cidr4: 32, cidr6: six }
+            let four = parse_length(str.slice(head, 1, str.len(head)), 32)
+            if four < 0
+                return Dual { ok: false, cidr4: 32, cidr6: 128 }
+            Dual { ok: true, cidr4: four, cidr6: six }
+        None    =>
+            if str.len(rest) == 0
+                return Dual { ok: true, cidr4: 32, cidr6: 128 }
+            let four = parse_length(str.slice(rest, 1, str.len(rest)), 32)
+            if four < 0
+                return Dual { ok: false, cidr4: 32, cidr6: 128 }
+            Dual { ok: true, cidr4: four, cidr6: 128 }
+
+// Where the CIDR lengths of `a:domain/24//64` begin: the first slash,
+// outside a macro, from which the rest of the argument is a valid dual
+// CIDR length.  A domain-spec may itself hold slashes, so a slash that
+// does not begin a valid length belongs to the domain.
+fn cidr_start(arg: Str) -> Int
+    var i = 0
+    let n = str.len(arg)
+    while i < n
+        let b = str.byte_at_or(arg, i, 0)
+        if b == '%' and str.byte_at_or(arg, i + 1, 0) == '{'
+            match str.index_from(arg, "}", i)
+                Some(k) =>
+                    i = k + 1
+                None    =>
+                    return -1
+        elif b == '/' and split_dual(str.slice(arg, i, n)).ok
+            return i
+        else
+            i += 1
+    -1
+
+fn bad(term: Str, why: Str) -> SpfError
+    SpfSyntax(term, why)
+
+fn blank_term(kind: SpfKind, q: SpfQualifier, text: Str) -> SpfTerm
+    SpfTerm { kind: kind, qualifier: q, spec: "", cidr4: 32, cidr6: 128, hi: 0, lo: 0, text: text }
+
+// A domain-spec checked against the macro grammar and the domain end.
+fn check_spec(term: Str, spec: Str) -> ?SpfError
+    match spfmacro.check(spec, false)
+        Err(e) =>
+            return Some(e)
+        Ok(_)  => 0
+    if not spfmacro.domain_end_ok(spec)
+        return Some(bad(term, "a domain must end in a top-level label or a macro"))
+    None
+
+// One directive: the qualifier is already removed.
+fn parse_directive(text: Str, q: SpfQualifier, body: Str) -> Result<SpfTerm, SpfError>
+    // The mechanism name ends at the first `:` or `/`.
+    var cut = str.len(body)
+    for k in 0..str.len(body)
+        let b = str.byte_at_or(body, k, 0)
+        if (b == ':' or b == '/') and cut == str.len(body)
+            cut = k
+    let name = str.lower(str.slice(body, 0, cut))
+    let has_colon = cut < str.len(body) and str.byte_at_or(body, cut, 0) == ':'
+    let arg = if has_colon
+        str.slice(body, cut + 1, str.len(body))
+    else
+        str.slice(body, cut, str.len(body))
+    let kind = match kind_of(name)
+        None    =>
+            return Err(bad(text, "`${name}` is not a mechanism"))
+        Some(k) => k
+    var t = blank_term(kind, q, text)
+    match kind
+        SpfAll     =>
+            if cut < str.len(body)
+                return Err(bad(text, "`all` takes no argument"))
+            Ok(t)
+        SpfInclude =>
+            if not has_colon
+                return Err(bad(text, "`include` needs a domain"))
+            match check_spec(text, arg)
+                Some(e) =>
+                    return Err(e)
+                None    => 0
+            t.spec = arg
+            Ok(t)
+        SpfExists  =>
+            if not has_colon
+                return Err(bad(text, "`exists` needs a domain"))
+            match check_spec(text, arg)
+                Some(e) =>
+                    return Err(e)
+                None    => 0
+            t.spec = arg
+            Ok(t)
+        SpfPtr     =>
+            if has_colon
+                match check_spec(text, arg)
+                    Some(e) =>
+                        return Err(e)
+                    None    => 0
+                t.spec = arg
+            elif cut < str.len(body)
+                return Err(bad(text, "`ptr` takes only a domain"))
+            Ok(t)
+        SpfA       =>
+            parse_a_or_mx(t, has_colon, arg, text)
+        SpfMx      =>
+            parse_a_or_mx(t, has_colon, arg, text)
+        SpfIp4     =>
+            if not has_colon
+                return Err(bad(text, "`ip4` needs an address"))
+            parse_ip4(t, arg, text)
+        SpfIp6     =>
+            if not has_colon
+                return Err(bad(text, "`ip6` needs an address"))
+            parse_ip6(t, arg, text)
+
+fn parse_a_or_mx(t: SpfTerm, has_colon: Bool, arg: Str, text: Str) -> Result<SpfTerm, SpfError>
+    var out = t
+    var rest = arg
+    if has_colon
+        let k = cidr_start(arg)
+        var domain = arg
+        rest = ""
+        if k >= 0
+            domain = str.slice(arg, 0, k)
+            rest = str.slice(arg, k, str.len(arg))
+        match check_spec(text, domain)
+            Some(e) =>
+                return Err(e)
+            None    => 0
+        out.spec = domain
+    let d = split_dual(rest)
+    if not d.ok
+        return Err(bad(text, "the CIDR length is not valid"))
+    out.cidr4 = d.cidr4
+    out.cidr6 = d.cidr6
+    Ok(out)
+
+fn parse_ip4(t: SpfTerm, arg: Str, text: Str) -> Result<SpfTerm, SpfError>
+    var out = t
+    var addr = arg
+    match str.index(arg, "/")
+        Some(k) =>
+            addr = str.slice(arg, 0, k)
+            let p = parse_length(str.slice(arg, k + 1, str.len(arg)), 32)
+            if p < 0
+                return Err(bad(text, "the prefix length is not valid"))
+            out.cidr4 = p
+        None    => 0
+    let raw = spfaddr.parse_qnum4(addr)
+    if raw < 0
+        return Err(bad(text, "`${addr}` is not an IPv4 address"))
+    out.lo = raw
+    Ok(out)
+
+fn parse_ip6(t: SpfTerm, arg: Str, text: Str) -> Result<SpfTerm, SpfError>
+    var out = t
+    var addr = arg
+    match str.index(arg, "/")
+        Some(k) =>
+            addr = str.slice(arg, 0, k)
+            let p = parse_length(str.slice(arg, k + 1, str.len(arg)), 128)
+            if p < 0
+                return Err(bad(text, "the prefix length is not valid"))
+            out.cidr6 = p
+        None    => 0
+    let n = spfaddr.parse_qnum6(addr)
+    if not n.ok
+        return Err(bad(text, "`${addr}` is not an IPv6 address"))
+    out.hi = n.hi
+    out.lo = n.lo
+    Ok(out)
+
+// Parse a record.  The text is the whole TXT string, beginning
+// `v=spf1`.  The answer is the record, or the first syntax error in it.
+//
+// ```novo
+// use spfrecord
+//
+// fn main() [io]
+//     match spfrecord.parse("v=spf1 ip4:192.0.2.0/24 mx -all")
+//         Ok(r)  => println("${list.len(r.terms)}")     // 3
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(txt: Str) -> Result<SpfRecord, SpfError> []
+    if not is_spf(txt)
+        return Err(bad(txt, "a record begins `v=spf1`"))
+    var rec = SpfRecord { terms: [], has_redirect: false, redirect: "", has_exp: false, exp: "" }
+    let pieces = str.split(str.slice(txt, 6, str.len(txt)), " ")
+    for piece in pieces
+        if str.len(piece) == 0
+            continue
+        let eq = str.index(piece, "=") ?? -1
+        let colon = str.index(piece, ":") ?? -1
+        let slash = str.index(piece, "/") ?? -1
+        // A term is a modifier when `=` comes before any `:` or `/` and
+        // the text before it is a modifier name (section 12).
+        let is_modifier = eq > 0 and (colon < 0 or eq < colon) and (slash < 0 or eq < slash)
+                and is_modifier_name(str.slice(piece, 0, eq))
+        if is_modifier
+            let name = str.lower(str.slice(piece, 0, eq))
+            let value = str.slice(piece, eq + 1, str.len(piece))
+            if name == "redirect"
+                if rec.has_redirect
+                    return Err(bad(piece, "`redirect` appears twice"))
+                match check_spec(piece, value)
+                    Some(e) =>
+                        return Err(e)
+                    None    => 0
+                rec.has_redirect = true
+                rec.redirect = value
+            elif name == "exp"
+                if rec.has_exp
+                    return Err(bad(piece, "`exp` appears twice"))
+                match check_spec(piece, value)
+                    Some(e) =>
+                        return Err(e)
+                    None    => 0
+                rec.has_exp = true
+                rec.exp = value
+            else
+                match spfmacro.check(value, false)
+                    Err(e) =>
+                        return Err(e)
+                    Ok(_)  => 0
+        else
+            var q = SpfPlus
+            var body = piece
+            match qualifier_of(str.byte_at_or(piece, 0, 0))
+                Some(found) =>
+                    q = found
+                    body = str.slice(piece, 1, str.len(piece))
+                None        => 0
+            match parse_directive(piece, q, body)
+                Err(e) =>
+                    return Err(e)
+                Ok(t)  => list.push(rec.terms, t)
+    Ok(rec)

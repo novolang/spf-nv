@@ -1,0 +1,653 @@
+// spfeval.nv — check_host() of RFC 7208 section 4, as a step.
+//
+// NOTHING HERE LOOKS ANYTHING UP.  `check_host` takes the request and
+// the DNS answers the caller already holds, and answers either a
+// verdict (`done`) or the one question it cannot go on without.  The
+// caller performs that lookup, appends the answer to its list, and
+// calls again:
+//
+//     answers = []
+//     loop
+//         out = spfeval.check_host(req, answers)
+//         if out.done: break
+//         answers.push(lookup(out.question))
+//
+// EVERY CALL EVALUATES FROM THE START.  The evaluation is a pure
+// function of the request and the answers, so a call that finds an
+// answer missing stops at the first one and says which; the next call,
+// with that answer in the list, replays the same terms in the same
+// order and goes one question further.  A policy needing thirty queries
+// is thirty short evaluations, which costs nothing next to a DNS round
+// trip and means the state between calls is a list the caller can print,
+// cache or record.  It is also why a test drives this package with a
+// table and no network.
+//
+// THE LIMITS ARE COUNTED IN TERMS, NOT IN CALLS.  Section 4.6.4 allows
+// ten terms that cause lookups (`include`, `a`, `mx`, `ptr`, `exists`
+// and `redirect`), ten names from one MX answer, and two void lookups;
+// a replay recounts them from zero each time and reaches the same
+// number at the same term, so the `permerror` of a policy that is over
+// the limit does not depend on how the caller drove the step.
+
+use spfaddr
+use spferror
+use spfmacro
+use spfrecord
+
+// The seven results of section 2.6.
+pub enum SpfResult
+    SpfNone
+    SpfNeutral
+    SpfPass
+    SpfFail
+    SpfSoftFail
+    SpfTempError
+    SpfPermError
+
+// The record types the evaluation asks for.
+pub enum SpfQType
+    SpfQTxt
+    SpfQA
+    SpfQAaaa
+    SpfQMx
+    SpfQPtr
+
+// How a lookup ended: with an answer (possibly an empty one), with a
+// name that does not exist, or with a failure that may pass.
+pub enum SpfDnsStatus
+    SpfDnsOk
+    SpfDnsNxDomain
+    SpfDnsTempFail
+
+// One question for the caller to put to the DNS.
+pub struct SpfQuestion
+    qtype: SpfQType
+    name: Str
+
+// The caller's answer to a question.  `values` are the answers as text:
+// for TXT, one string per record with its character strings joined;
+// for A and AAAA, the addresses; for MX, the exchange names (a leading
+// preference number is accepted and ignored); for PTR, the names.
+pub struct SpfAnswer
+    qtype: SpfQType
+    name: Str
+    status: SpfDnsStatus
+    values: [Str]
+
+// What a check is asked about: the client address as text, the sender
+// (`local@domain`, or a bare domain), the HELO name, the name of the
+// receiving host for `%{r}`, and the time for `%{t}`.
+pub struct SpfRequest
+    ip: Str
+    sender: Str
+    helo: Str
+    receiver: Str
+    now: Int
+
+// The finished check.  `mechanism` is the term that matched, or
+// `default` when none did; `reason` says why an error is an error;
+// `domain` is the domain whose record was asked first; `lookups` and
+// `voids` are the counts the limits are applied to.
+pub struct SpfVerdict
+    result: SpfResult
+    explanation: Str
+    mechanism: Str
+    reason: Str
+    domain: Str
+    lookups: Int
+    voids: Int
+
+// What a call answers: finished (`done`, with `verdict`), or waiting
+// for `question` (with `done` false).
+pub struct SpfOutcome
+    done: Bool
+    question: SpfQuestion
+    verdict: SpfVerdict
+
+// The interface a caller can implement once and hand to `check_with`.
+// The effect parameter is the cost of one lookup: nothing for a table
+// in memory, `[net]` for a resolver.
+pub trait SpfResolver[e]
+    // Answer one question.
+    fn resolve(self, q: SpfQuestion) -> SpfAnswer [e]
+
+// ── Building requests and answers ────────────────────────────────────
+
+// A request.  An empty `mailfrom` means a null sender, and the check
+// then runs against `postmaster@helo` as section 2.4 says.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     let r = spfeval.request("192.0.2.1", "alice@example.com", "mail.example.com", "mx.example.net", 0)
+//     println(r.sender)     // alice@example.com
+// ```
+pub fn request(ip: Str, mailfrom: Str, helo: Str, receiver: Str, now: Int) -> SpfRequest []
+    let sender = if mailfrom == ""
+        "postmaster@${helo}"
+    else
+        mailfrom
+    SpfRequest { ip: ip, sender: sender, helo: helo, receiver: receiver, now: now }
+
+// An answer that exists, with its values.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     let a = spfeval.answer(SpfQA, "example.com", ["192.0.2.1"])
+//     println("${list.len(a.values)}")     // 1
+// ```
+pub fn answer(qtype: SpfQType, name: Str, values: [Str]) -> SpfAnswer []
+    SpfAnswer { qtype: qtype, name: name, status: SpfDnsOk, values: values }
+
+// A name that does not exist (RCODE 3).
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     let a = spfeval.nxdomain(SpfQTxt, "gone.example.com")
+//     println(a.name)
+// ```
+pub fn nxdomain(qtype: SpfQType, name: Str) -> SpfAnswer []
+    SpfAnswer { qtype: qtype, name: name, status: SpfDnsNxDomain, values: [] }
+
+// A lookup that failed in a way that may pass: a timeout or SERVFAIL.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     let a = spfeval.temp_fail(SpfQTxt, "slow.example.com")
+//     println(a.name)
+// ```
+pub fn temp_fail(qtype: SpfQType, name: Str) -> SpfAnswer []
+    SpfAnswer { qtype: qtype, name: name, status: SpfDnsTempFail, values: [] }
+
+// The result as section 2.6 spells it: `pass`, `fail`, `softfail`,
+// `neutral`, `none`, `temperror` or `permerror`.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     println(spfeval.result_name(SpfSoftFail))     // softfail
+// ```
+pub fn result_name(r: SpfResult) -> Str []
+    match r
+        SpfNone      => "none"
+        SpfNeutral   => "neutral"
+        SpfPass      => "pass"
+        SpfFail      => "fail"
+        SpfSoftFail  => "softfail"
+        SpfTempError => "temperror"
+        SpfPermError => "permerror"
+
+// The record type's name as a DNS tool writes it.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     println(spfeval.qtype_name(SpfQMx))     // MX
+// ```
+pub fn qtype_name(t: SpfQType) -> Str []
+    match t
+        SpfQTxt  => "TXT"
+        SpfQA    => "A"
+        SpfQAaaa => "AAAA"
+        SpfQMx   => "MX"
+        SpfQPtr  => "PTR"
+
+// ── The evaluation state ─────────────────────────────────────────────
+
+// The state of one evaluation.  `fault` is 0 while all is well, 1 when
+// an answer is missing (the question is in `q_type` and `q_name`), 2
+// for a temporary error and 3 for a permanent one.
+struct Ev
+    answers: [SpfAnswer]
+    req: SpfRequest
+    client: SpfIp
+    local: Str
+    sender_domain: Str
+    var terms: Int
+    var voids: Int
+    var fault: Int
+    var q_type: SpfQType
+    var q_name: Str
+    var reason: Str
+    var mech: Str
+    var exp_spec: Str
+    var exp_domain: Str
+    var include_depth: Int
+
+fn norm(name: Str) -> Str
+    let n = str.len(name)
+    if n > 0 and str.byte_at_or(name, n - 1, 0) == '.'
+        str.lower(str.slice(name, 0, n - 1))
+    else
+        str.lower(name)
+
+// A name that can be looked up: 1 to 253 octets, labels of 1 to 63.
+fn valid_domain(name: Str) -> Bool
+    let n = norm(name)
+    if str.len(n) == 0 or str.len(n) > 253
+        return false
+    for label in str.split(n, ".")
+        if str.len(label) == 0 or str.len(label) > 63
+            return false
+    true
+
+fn ask(var ev: Ev, qt: SpfQType, name: Str) -> SpfAnswer
+    let key = norm(name)
+    for a in ev.answers
+        if a.qtype == qt and norm(a.name) == key
+            return a
+    ev.fault = 1
+    ev.q_type = qt
+    ev.q_name = key
+    SpfAnswer { qtype: qt, name: key, status: SpfDnsOk, values: [] }
+
+fn void_lookup(var ev: Ev)
+    ev.voids += 1
+    if ev.voids > 2
+        ev.fault = 3
+        ev.reason = "more than 2 lookups returned no data"
+
+// The values of one lookup, with the temporary-error and void
+// accounting of section 4.6.4 applied.  An invalid name answers nothing
+// and counts as void.
+fn lookup(var ev: Ev, qt: SpfQType, name: Str) -> readonly [Str]
+    if not valid_domain(name)
+        void_lookup(var ev)
+        return []
+    let a = ask(var ev, qt, name)
+    if ev.fault != 0
+        return []
+    if a.status == SpfDnsTempFail
+        ev.fault = 2
+        ev.reason = "the lookup of ${norm(name)} failed temporarily"
+        return []
+    if a.status == SpfDnsNxDomain or list.len(a.values) == 0
+        void_lookup(var ev)
+        return []
+    a.values
+
+fn count_term(var ev: Ev) -> Bool
+    ev.terms += 1
+    if ev.terms > 10
+        ev.fault = 3
+        ev.reason = "more than 10 terms cause lookups"
+        return false
+    true
+
+fn ends_with_domain(name: Str, domain: Str) -> Bool
+    let n = norm(name)
+    let d = norm(domain)
+    n == d or str.ends_with(n, ".${d}")
+
+fn macro_ctx(ev: Ev, domain: Str, validated: Str) -> SpfMacroEnv
+    SpfMacroEnv { local: ev.local, sender_domain: ev.sender_domain, helo: ev.req.helo,
+                  domain: domain, client: ev.client, validated: validated,
+                  receiver: ev.req.receiver, now: ev.req.now }
+
+// The names that a PTR lookup of the client confirms: each name from
+// the reverse lookup whose own address lookup contains the client
+// (section 5.5).  At most ten names are tried, and an error on any one
+// lookup skips that name.
+fn validated_names(var ev: Ev) -> [Str]
+    var out: [Str] = []
+    let rev = ask(var ev, SpfQPtr, spfaddr.reverse_name(ev.client))
+    if ev.fault != 0 or rev.status != SpfDnsOk
+        return out
+    var tried = 0
+    for raw in rev.values
+        if tried >= 10
+            break
+        tried += 1
+        let name = norm(raw)
+        let fwd_type = if ev.client.v6
+            SpfQAaaa
+        else
+            SpfQA
+        let fwd = ask(var ev, fwd_type, name)
+        if ev.fault != 0
+            return out
+        if fwd.status == SpfDnsOk
+            for addr in fwd.values
+                if spfaddr.matches_text(ev.client, addr, 32, 128)
+                    list.push(out, name)
+                    break
+    out
+
+// The `%{p}` letter: a validated name under `domain` if there is one,
+// otherwise any validated name, otherwise `unknown`.
+fn validated_for_macro(var ev: Ev, domain: Str) -> Str
+    let names = validated_names(var ev)
+    for n in names
+        if ends_with_domain(n, domain)
+            return n
+    if list.len(names) > 0
+        return names[0]
+    "unknown"
+
+// Expand a domain-spec against the current domain.
+fn expand_domain(var ev: Ev, spec: Str, domain: Str) -> Str
+    var validated = "unknown"
+    if spfmacro.uses_p(spec)
+        validated = validated_for_macro(var ev, domain)
+        if ev.fault != 0
+            return ""
+    spfmacro.fit_domain(norm(spfmacro.expand_checked(spec, macro_ctx(ev, domain, validated))))
+
+fn target_of(var ev: Ev, t: SpfTerm, domain: Str) -> Str
+    if t.spec == ""
+        return domain
+    expand_domain(var ev, t.spec, domain)
+
+fn result_of(q: SpfQualifier) -> SpfResult
+    match q
+        SpfPlus     => SpfPass
+        SpfMinus    => SpfFail
+        SpfTilde    => SpfSoftFail
+        SpfQuestion => SpfNeutral
+
+// The last word of an MX answer: the exchange, without a preference.
+fn exchange_of(v: Str) -> Str
+    match str.index(v, " ")
+        None    => v
+        Some(_) =>
+            let parts = str.split(v, " ")
+            parts[list.len(parts) - 1]
+
+fn address_type(ev: Ev) -> SpfQType
+    if ev.client.v6
+        SpfQAaaa
+    else
+        SpfQA
+
+// Whether any of the answers' addresses is the client.
+fn any_matches(ev: Ev, addrs: [Str], t: SpfTerm) -> Bool
+    for a in addrs
+        if spfaddr.matches_text(ev.client, a, t.cidr4, t.cidr6)
+            return true
+    false
+
+// One mechanism.  The answer is 1 for a match and 0 for no match; an
+// error sets `ev.fault` and the answer does not matter.
+fn eval_term(var ev: Ev, t: SpfTerm, domain: Str) -> Int
+    match t.kind
+        SpfAll     =>
+            1
+        SpfIp4     =>
+            if spfaddr.in_net4(ev.client, t.lo, t.cidr4)
+                1
+            else
+                0
+        SpfIp6     =>
+            if spfaddr.in_net6(ev.client, t.hi, t.lo, t.cidr6)
+                1
+            else
+                0
+        SpfInclude =>
+            if not count_term(var ev)
+                return 0
+            let target = target_of(var ev, t, domain)
+            if ev.fault != 0
+                return 0
+            ev.include_depth += 1
+            let sub = check_domain(var ev, target)
+            ev.include_depth -= 1
+            if ev.fault != 0
+                return 0
+            match sub
+                SpfPass => 1
+                SpfNone =>
+                    ev.fault = 3
+                    ev.reason = "${norm(target)} has no SPF record"
+                    0
+                _       => 0
+        SpfExists  =>
+            if not count_term(var ev)
+                return 0
+            let target = target_of(var ev, t, domain)
+            if ev.fault != 0
+                return 0
+            let found = lookup(var ev, SpfQA, target)
+            if ev.fault == 0 and list.len(found) > 0
+                1
+            else
+                0
+        SpfA       =>
+            if not count_term(var ev)
+                return 0
+            let target = target_of(var ev, t, domain)
+            if ev.fault != 0
+                return 0
+            let addrs = lookup(var ev, address_type(ev), target)
+            if ev.fault == 0 and any_matches(ev, addrs, t)
+                1
+            else
+                0
+        SpfMx      =>
+            if not count_term(var ev)
+                return 0
+            let target = target_of(var ev, t, domain)
+            if ev.fault != 0
+                return 0
+            let names = lookup(var ev, SpfQMx, target)
+            if ev.fault != 0
+                return 0
+            if list.len(names) > 10
+                ev.fault = 3
+                ev.reason = "more than 10 MX names"
+                return 0
+            for m in names
+                let addrs = lookup(var ev, address_type(ev), exchange_of(m))
+                if ev.fault != 0
+                    return 0
+                if any_matches(ev, addrs, t)
+                    return 1
+            0
+        SpfPtr     =>
+            if not count_term(var ev)
+                return 0
+            let target = target_of(var ev, t, domain)
+            if ev.fault != 0
+                return 0
+            let names = validated_names(var ev)
+            if ev.fault != 0
+                return 0
+            for n in names
+                if ends_with_domain(n, target)
+                    return 1
+            0
+
+// The record of one domain, evaluated.
+fn eval_record(var ev: Ev, rec: SpfRecord, domain: Str) -> SpfResult
+    for t in rec.terms
+        let hit = eval_term(var ev, t, domain)
+        if ev.fault != 0
+            return SpfPermError
+        if hit == 1
+            ev.mech = t.text
+            let r = result_of(t.qualifier)
+            if r == SpfFail and ev.include_depth == 0 and rec.has_exp
+                ev.exp_spec = rec.exp
+                ev.exp_domain = domain
+            return r
+    if rec.has_redirect
+        if not count_term(var ev)
+            return SpfPermError
+        let target = expand_domain(var ev, rec.redirect, domain)
+        if ev.fault != 0
+            return SpfPermError
+        let sub = check_domain(var ev, target)
+        if ev.fault == 0 and sub == SpfNone
+            ev.fault = 3
+            ev.reason = "${norm(target)} has no SPF record"
+        return sub
+    ev.mech = "default"
+    SpfNeutral
+
+// check_host() for one domain (section 4): fetch its record, parse it,
+// evaluate it.
+fn check_domain(var ev: Ev, domain: Str) -> SpfResult
+    if not valid_domain(domain)
+        return SpfNone
+    let a = ask(var ev, SpfQTxt, domain)
+    if ev.fault != 0
+        return SpfPermError
+    if a.status == SpfDnsTempFail
+        ev.fault = 2
+        ev.reason = "the lookup of ${norm(domain)} failed temporarily"
+        return SpfTempError
+    var found: [Str] = []
+    for v in a.values
+        if spfrecord.is_spf(v)
+            list.push(found, v)
+    if list.len(found) == 0
+        return SpfNone
+    if list.len(found) > 1
+        ev.fault = 3
+        ev.reason = "${norm(domain)} publishes more than one SPF record"
+        return SpfPermError
+    match spfrecord.parse(found[0])
+        Err(e)  =>
+            ev.fault = 3
+            ev.reason = e.message()
+            SpfPermError
+        Ok(rec) =>
+            eval_record(var ev, rec, domain)
+
+// The explanation of a `fail` (section 6.2): the TXT record at the
+// `exp` target, macro-expanded.  The result is already decided, so an
+// answer that cannot be used gives an empty explanation and never
+// changes the result; only a missing answer is asked for.
+fn explain(var ev: Ev) -> Str
+    let target = expand_domain(var ev, ev.exp_spec, ev.exp_domain)
+    if ev.fault != 0
+        return ""
+    let a = ask(var ev, SpfQTxt, target)
+    if ev.fault != 0
+        return ""
+    if a.status != SpfDnsOk or list.len(a.values) != 1
+        return ""
+    let text = a.values[0]
+    var validated = "unknown"
+    if spfmacro.uses_p(text)
+        validated = validated_for_macro(var ev, ev.exp_domain)
+        if ev.fault != 0
+            return ""
+    match spfmacro.expand(text, macro_ctx(ev, ev.exp_domain, validated), true)
+        Err(_) => ""
+        Ok(s)  => s
+
+fn empty_verdict(domain: Str) -> SpfVerdict
+    SpfVerdict { result: SpfNone, explanation: "", mechanism: "", reason: "", domain: domain,
+                 lookups: 0, voids: 0 }
+
+fn finish(ev: Ev, r: SpfResult, explanation: Str, domain: Str) -> SpfVerdict
+    let result = if ev.fault == 2
+        SpfTempError
+    elif ev.fault == 3
+        SpfPermError
+    else
+        r
+    SpfVerdict { result: result, explanation: explanation, mechanism: ev.mech, reason: ev.reason,
+                 domain: domain, lookups: ev.terms, voids: ev.voids }
+
+fn waiting(ev: Ev, domain: Str) -> SpfOutcome
+    SpfOutcome { done: false,
+                 question: SpfQuestion { qtype: ev.q_type, name: ev.q_name },
+                 verdict: empty_verdict(domain) }
+
+fn last_at(s: Str) -> Int
+    var at = -1
+    for k in 0..str.len(s)
+        if str.byte_at_or(s, k, 0) == '@'
+            at = k
+    at
+
+// Run one step of check_host() (section 4).  Either the check is
+// finished, and `verdict` says how, or the answer to `question` is
+// missing and the caller supplies it.
+//
+// ```novo
+// use spfeval
+//
+// fn main() [io]
+//     let req = spfeval.request("192.0.2.1", "a@example.com", "mx.example.com", "me", 0)
+//     let out = spfeval.check_host(req, [])
+//     println("${out.done}")                        // false
+//     println(spfeval.qtype_name(out.question.qtype))   // TXT
+//     println(out.question.name)                   // example.com
+// ```
+pub fn check_host(req: SpfRequest, answers: [SpfAnswer]) -> SpfOutcome []
+    let at = last_at(req.sender)
+    var local = "postmaster"
+    var domain = req.sender
+    if at >= 0
+        domain = str.slice(req.sender, at + 1, str.len(req.sender))
+        if at > 0
+            local = str.slice(req.sender, 0, at)
+    match spfaddr.parse_ip(req.ip)
+        Err(_)     =>
+            let v = SpfVerdict { result: SpfPermError, explanation: "", mechanism: "",
+                                reason: "the client address `${req.ip}` is not an IP address",
+                                domain: domain, lookups: 0, voids: 0 }
+            SpfOutcome { done: true,
+                question: SpfQuestion { qtype: SpfQTxt, name: "" },
+                verdict: v }
+        Ok(client) =>
+            var ev = Ev { answers: answers, req: req, client: client, local: local,
+                          sender_domain: domain, terms: 0, voids: 0, fault: 0,
+                          q_type: SpfQTxt, q_name: "", reason: "", mech: "", exp_spec: "",
+                          exp_domain: "", include_depth: 0 }
+            let r = check_domain(var ev, domain)
+            if ev.fault == 1
+                return waiting(ev, domain)
+            var explanation = ""
+            if r == SpfFail and ev.fault == 0 and ev.exp_spec != ""
+                explanation = explain(var ev)
+                if ev.fault == 1
+                    return waiting(ev, domain)
+            SpfOutcome { done: true, question: SpfQuestion { qtype: SpfQTxt, name: "" },
+                         verdict: finish(ev, r, explanation, domain) }
+
+// Drive `check_host` with a resolver until the check is finished.  The
+// row is the resolver's: `check_with` costs what one lookup costs, and
+// nothing when the resolver reads a table.  A resolver that keeps
+// answering a question other than the one it was asked ends the loop
+// after a bounded number of rounds with a `permerror`.
+//
+// ```novo
+// use spfeval
+//
+// struct Table
+//     none: Int
+//
+// impl SpfResolver[] for Table
+//     fn resolve(self, q: SpfQuestion) -> SpfAnswer []
+//         if q.name == "example.com"
+//             spfeval.answer(SpfQTxt, q.name, ["v=spf1 +all"])
+//         else
+//             spfeval.nxdomain(q.qtype, q.name)
+//
+// fn main() [io]
+//     let req = spfeval.request("192.0.2.1", "a@example.com", "h", "me", 0)
+//     let v = spfeval.check_with(Table { none: 0 }, req)
+//     println(spfeval.result_name(v.result))   // pass
+// ```
+pub fn check_with<R: SpfResolver[e]>(resolver: R, req: SpfRequest) -> SpfVerdict [e]
+    var answers: [SpfAnswer] = []
+    for _ in 0..200
+        let out = check_host(req, answers)
+        if out.done
+            return out.verdict
+        list.push(answers, resolver.resolve(out.question))
+    SpfVerdict { result: SpfPermError, explanation: "", mechanism: "",
+                 reason: "the resolver did not answer the questions it was asked",
+                 domain: "", lookups: 0, voids: 0 }

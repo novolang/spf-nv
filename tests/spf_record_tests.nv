@@ -1,0 +1,407 @@
+// spf_record_tests.nv — the address arithmetic, the macro strings and the
+// record grammar.
+//
+// The macro vectors are the table of RFC 7208 section 7.4, with the
+// sender `strong-bad@email.example.com` and the client 192.0.2.3.  The
+// record vectors are the grammar of section 12, one term at a time, and
+// each refusal names the rule it tests.
+
+use std.test
+use spfaddr
+use spferror
+use spfmacro
+use spfrecord
+
+fn client(text: Str) -> SpfIp
+    match spfaddr.parse_ip(text)
+        Ok(a)  => a
+        Err(_) =>
+            test.fail("not an address: ${text}")
+            SpfIp { v6: false, v4: 0, hi: 0, lo: 0 }
+
+fn env_for(text: Str) -> SpfMacroEnv
+    SpfMacroEnv { local: "strong-bad", sender_domain: "email.example.com",
+                  helo: "mx.example.org", domain: "email.example.com",
+                  client: client(text), validated: "unknown",
+                  receiver: "mx.receiver.example", now: 1700000000 }
+
+fn passes(r: Result<Unit, SpfError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+fn expanded(spec: Str, text: Str) -> Str
+    match spfmacro.expand(spec, env_for(text), true)
+        Ok(s)  => s
+        Err(e) => "ERR ${e.message()}"
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+@test
+fn test_an_address_is_read_and_written_in_the_forms_the_macros_use() [io]
+    test.case("an IPv4 address")
+    let a = client("192.0.2.3")
+    test.assert(not a.v6)
+    test.assert(spfaddr.dotted(a) == "192.0.2.3")
+    test.assert(spfaddr.pretty(a) == "192.0.2.3")
+    test.assert(spfaddr.family(a) == "in-addr")
+    test.assert(spfaddr.reverse_name(a) == "3.2.0.192.in-addr.arpa")
+
+    test.case("an IPv6 address: nibbles for %{i}, RFC 5952 for %{c}")
+    let b = client("2001:DB8::CB01")
+    test.assert(b.v6)
+    test.assert(spfaddr.dotted(b) == "2.0.0.1.0.d.b.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.c.b.0.1")
+    test.assert(spfaddr.pretty(b) == "2001:db8::cb01")
+    test.assert(spfaddr.family(b) == "ip6")
+    test.assert(spfaddr.reverse_name(b) == "1.0.b.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa")
+
+    test.case("an IPv4-mapped IPv6 address is an IPv4 address (section 5)")
+    let m = client("::ffff:192.0.2.3")
+    test.assert(not m.v6)
+    test.assert(spfaddr.dotted(m) == "192.0.2.3")
+
+    test.case("text that is neither is refused with the text in the message")
+    match spfaddr.parse_ip("1::2::3")
+        Err(e) => test.assert(spferror.message(e) == "`1::2::3` is not an IPv6 address")
+        Ok(_)  => test.fail("two :: are not an address")
+    match spfaddr.parse_ip("300.1.1.1")
+        Err(e) => test.assert(spferror.code(e) == "request")
+        Ok(_)  => test.fail("300 is not an octet")
+
+@test
+fn test_membership_is_a_mask_and_a_comparison() [io]
+    let a = client("192.0.2.3")
+    test.case("IPv4 prefixes")
+    test.assert(spfaddr.in_net4(a, 3221225984, 24))
+    test.assert(spfaddr.in_net4(a, 3221225984, 31) == false)
+    test.assert(spfaddr.in_net4(a, 3221225987, 32))
+    test.assert(spfaddr.in_net4(a, 1, 0))
+    test.assert(spfaddr.in_net4(client("2001:db8::1"), 3221225984, 24) == false)
+
+    let b = client("2001:db8:1:2:3:4:5:6")
+    let hi = b.hi
+    let lo = b.lo
+    test.case("IPv6 prefixes below, at and above 64 bits")
+    test.assert(spfaddr.in_net6(b, hi, lo, 128))
+    test.assert(spfaddr.in_net6(b, hi, 0, 64))
+    test.assert(spfaddr.in_net6(b, hi + 1, 0, 64) == false)
+    test.assert(spfaddr.in_net6(b, hi, lo, 0))
+    test.assert(spfaddr.in_net6(b, hi, 0, 32))
+    test.assert(spfaddr.in_net6(b, hi + 4294967296, 0, 32) == false)
+    test.assert(spfaddr.in_net6(b, hi, lo, 96))
+    test.assert(spfaddr.in_net6(b, hi, lo + 1, 96))
+    test.assert(spfaddr.in_net6(b, hi, lo + 4294967296, 96) == false)
+    test.assert(spfaddr.in_net6(b, hi + 1, lo, 96) == false)
+    test.assert(spfaddr.in_net6(a, hi, lo, 32) == false)
+
+    test.case("a looked-up address under the CIDR lengths of an a or mx term")
+    test.assert(spfaddr.matches_text(a, "192.0.2.77", 24, 128))
+    test.assert(spfaddr.matches_text(a, "192.0.2.77", 32, 128) == false)
+    test.assert(spfaddr.matches_text(b, "2001:db8:1:2::", 32, 64))
+    test.assert(spfaddr.matches_text(b, "2001:db9::", 32, 64) == false)
+    test.assert(spfaddr.matches_text(a, "2001:db8::1", 32, 128) == false)
+    test.assert(spfaddr.matches_text(a, "not an address", 32, 128) == false)
+
+@test
+fn test_the_ip4_and_ip6_arguments_have_a_stricter_grammar_than_the_parser() [io]
+    test.case("ip4: four decimal numbers, no leading zeros, each at most 255")
+    test.assert(spfaddr.parse_qnum4("192.0.2.1") == 3221225985)
+    test.assert(spfaddr.parse_qnum4("192.0.2") == -1)
+    test.assert(spfaddr.parse_qnum4("192.0..1") == -1)
+    test.assert(spfaddr.parse_qnum4("1.2.3.4444") == -1)
+    test.assert(spfaddr.parse_qnum4("1.2.3.04") == -1)
+    test.assert(spfaddr.parse_qnum4("1.2.3.0") == 16909056)
+    test.assert(spfaddr.parse_qnum4("1.2.3.x") == -1)
+    test.assert(spfaddr.parse_qnum4("1.2.3.256") == -1)
+
+    test.case("ip6: an IPv6 address, and nothing else")
+    test.assert(spfaddr.parse_qnum6("2001:db8::").ok)
+    test.assert(spfaddr.parse_qnum6("192.0.2.1").ok == false)
+    test.assert(spfaddr.parse_qnum6("1::2::3").ok == false)
+
+// ── The macro strings of RFC 7208 section 7 ──────────────────────────
+
+@test
+fn test_rfc_7208_section_7_4_ipv4_examples() [io]
+    test.case("the letters")
+    test.assert(expanded("%{s}", "192.0.2.3") == "strong-bad@email.example.com")
+    test.assert(expanded("%{o}", "192.0.2.3") == "email.example.com")
+    test.assert(expanded("%{d}", "192.0.2.3") == "email.example.com")
+    test.assert(expanded("%{d4}", "192.0.2.3") == "email.example.com")
+    test.assert(expanded("%{d3}", "192.0.2.3") == "email.example.com")
+    test.assert(expanded("%{d2}", "192.0.2.3") == "example.com")
+    test.assert(expanded("%{d1}", "192.0.2.3") == "com")
+    test.assert(expanded("%{dr}", "192.0.2.3") == "com.example.email")
+    test.assert(expanded("%{d2r}", "192.0.2.3") == "example.email")
+    test.assert(expanded("%{l}", "192.0.2.3") == "strong-bad")
+    test.assert(expanded("%{l-}", "192.0.2.3") == "strong.bad")
+    test.assert(expanded("%{lr}", "192.0.2.3") == "strong-bad")
+    test.assert(expanded("%{lr-}", "192.0.2.3") == "bad.strong")
+    test.assert(expanded("%{l1r-}", "192.0.2.3") == "strong")
+
+    test.case("the macro strings")
+    test.assert(expanded("%{ir}.%{v}._spf.%{d2}", "192.0.2.3") == "3.2.0.192.in-addr._spf.example.com")
+    test.assert(expanded("%{lr-}.lp._spf.%{d2}", "192.0.2.3") == "bad.strong.lp._spf.example.com")
+    test.assert(expanded("%{lr-}.lp.%{ir}.%{v}._spf.%{d2}", "192.0.2.3") == "bad.strong.lp.3.2.0.192.in-addr._spf.example.com")
+    test.assert(expanded("%{ir}.%{v}.%{l1r-}.lp._spf.%{d2}", "192.0.2.3") == "3.2.0.192.in-addr.strong.lp._spf.example.com")
+    test.assert(expanded("%{d2}.trusted-domains.example.net", "192.0.2.3") == "example.com.trusted-domains.example.net")
+
+@test
+fn test_rfc_7208_section_7_4_ipv6_example() [io]
+    test.assert(expanded("%{ir}.%{v}._spf.%{d2}", "2001:db8::cb01") == "1.0.b.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6._spf.example.com")
+
+@test
+fn test_the_remaining_letters_the_escapes_and_the_url_forms() [io]
+    test.case("h, c, r and t")
+    test.assert(expanded("%{h}", "192.0.2.3") == "mx.example.org")
+    test.assert(expanded("%{c}", "2001:DB8::1") == "2001:db8::1")
+    test.assert(expanded("%{r}", "192.0.2.3") == "mx.receiver.example")
+    test.assert(expanded("%{t}", "192.0.2.3") == "1700000000")
+    test.assert(expanded("%{p}", "192.0.2.3") == "unknown")
+
+    test.case("%% is a percent sign, %_ a space and %- the three characters %20")
+    test.assert(expanded("a%%b%_c%-d", "192.0.2.3") == "a%b c%20d")
+
+    test.case("an upper-case letter URL-escapes its expansion")
+    test.assert(expanded("%{S}", "192.0.2.3") == "strong-bad%40email.example.com")
+    test.assert(expanded("%{L}", "192.0.2.3") == "strong-bad")
+    test.assert(spfmacro.url_escape("a b/c~d_e.f-g") == "a%20b%2Fc~d_e.f-g")
+    test.assert(spfmacro.url_escape("é") == "%C3%A9")
+
+    test.case("a delimiter set splits on every delimiter named")
+    test.assert(expanded("%{lr-}", "192.0.2.3") == "bad.strong")
+    test.assert(expanded("%{l-+}", "192.0.2.3") == "strong.bad")
+    test.assert(expanded("%{o.-+,/_=}", "192.0.2.3") == "email.example.com")
+
+@test
+fn test_a_macro_string_is_checked_against_section_7_1() [io]
+    test.case("valid forms")
+    test.assert(passes(spfmacro.check("", false)))
+    test.assert(passes(spfmacro.check("%{ir}.%{v}._spf.%{d2}", false)))
+    test.assert(passes(spfmacro.check("see %{s} now", true)))
+    test.assert(passes(spfmacro.check("%{c}%{r}%{t}", true)))
+
+    test.case("a lone percent sign, an unknown letter and an unclosed brace")
+    test.assert(expanded("100%", "192.0.2.3") == "ERR the macro string `100%` is not valid: a `%` must begin `%%`, `%_`, `%-` or `%{`")
+    test.assert(passes(spfmacro.check("%{x}", false)) == false)
+    test.assert(passes(spfmacro.check("%{d", false)) == false)
+    test.assert(passes(spfmacro.check("%{d1", false)) == false)
+    test.assert(passes(spfmacro.check("%{}", false)) == false)
+
+    test.case("c, r and t are defined only in an explanation")
+    test.assert(passes(spfmacro.check("%{r}", false)) == false)
+    test.assert(passes(spfmacro.check("%{T}", false)) == false)
+    test.assert(passes(spfmacro.check("%{c}", false)) == false)
+
+    test.case("a transformer of zero parts is refused, and a count of ten is not")
+    test.assert(passes(spfmacro.check("%{d0}", false)) == false)
+    test.assert(passes(spfmacro.check("%{d10}", false)))
+
+    test.case("a domain-spec holds no space and no control character, an explanation holds spaces")
+    test.assert(passes(spfmacro.check("a b", false)) == false)
+    test.assert(passes(spfmacro.check("a\tb", true)) == false)
+    test.assert(passes(spfmacro.check("a\x7Fb", false)) == false)
+
+@test
+fn test_a_domain_spec_ends_in_a_toplabel_or_a_macro() [io]
+    test.assert(spfmacro.domain_end_ok("example.com"))
+    test.assert(spfmacro.domain_end_ok("example.com."))
+    test.assert(spfmacro.domain_end_ok("%{d}"))
+    test.assert(spfmacro.domain_end_ok("x.%{d}"))
+    test.assert(spfmacro.domain_end_ok("") == false)
+    test.assert(spfmacro.domain_end_ok("example") == false)
+    test.assert(spfmacro.domain_end_ok("example.") == false)
+    test.assert(spfmacro.domain_end_ok("1.2.3.4") == false)
+    test.assert(spfmacro.domain_end_ok("example.c-m"))
+    test.assert(spfmacro.domain_end_ok("example.-cm") == false)
+    test.assert(spfmacro.domain_end_ok("example.cm-") == false)
+    test.assert(spfmacro.domain_end_ok("example.c_m") == false)
+    test.assert(spfmacro.domain_end_ok("example..") == false)
+
+@test
+fn test_the_p_letter_is_found_without_expanding() [io]
+    test.assert(spfmacro.uses_p("%{p}.example.com"))
+    test.assert(spfmacro.uses_p("%{P}.example.com"))
+    test.assert(spfmacro.uses_p("%{d}.%{ir}") == false)
+    test.assert(spfmacro.uses_p("%%p") == false)
+    test.assert(spfmacro.uses_p("%x{p}") == false)
+    test.assert(spfmacro.uses_p("") == false)
+
+@test
+fn test_an_expanded_name_is_cut_to_253_octets_from_the_left() [io]
+    test.assert(spfmacro.fit_domain("a.b.c") == "a.b.c")
+    let label = str.repeat("x", 60)
+    let long = "${label}.${label}.${label}.${label}.${label}.com"
+    test.assert(str.len(long) > 253)
+    let cut = spfmacro.fit_domain(long)
+    test.assert(str.len(cut) <= 253)
+    test.assert(str.ends_with(cut, ".com"))
+    test.assert(cut == "${label}.${label}.${label}.${label}.com")
+    test.case("one label longer than the limit has no dot to cut at")
+    let one = str.repeat("y", 300)
+    test.assert(str.len(spfmacro.fit_domain(one)) == 253)
+
+// ── The record grammar of section 12 ─────────────────────────────────
+
+fn terms_of(text: Str) -> [SpfTerm]
+    match spfrecord.parse(text)
+        Ok(r)  => r.terms
+        Err(e) =>
+            test.fail("${text}: ${e.message()}")
+            []
+
+fn refused(text: Str) -> Bool
+    match spfrecord.parse(text)
+        Ok(_)  => false
+        Err(_) => true
+
+@test
+fn test_a_record_is_recognised_by_its_version() [io]
+    test.assert(spfrecord.is_spf("v=spf1"))
+    test.assert(spfrecord.is_spf("V=SPF1 -all"))
+    test.assert(spfrecord.is_spf("v=spf10") == false)
+    test.assert(spfrecord.is_spf("v=spf") == false)
+    test.assert(spfrecord.is_spf("spf2.0/pra") == false)
+    test.assert(refused("v=spf2 -all"))
+    match spfrecord.parse("v=spf2 -all")
+        Err(e) => test.assert(spferror.code(e) == "syntax")
+        Ok(_)  => test.fail("version 2 is not version 1")
+
+@test
+fn test_every_mechanism_and_qualifier_parses() [io]
+    let ts = terms_of("v=spf1 +all -include:_spf.example.com ~a ?mx:mail.example.com/24//64 ptr:example.org exists:%{ir}.x.example.com ip4:192.0.2.0/24 ip6:2001:db8::/32")
+    test.assert(list.len(ts) == 8)
+    test.assert(ts[0].kind == SpfAll and ts[0].qualifier == SpfPlus)
+    test.assert(ts[1].kind == SpfInclude and ts[1].qualifier == SpfMinus and ts[1].spec == "_spf.example.com")
+    test.assert(ts[2].kind == SpfA and ts[2].qualifier == SpfTilde and ts[2].spec == "")
+    test.assert(ts[3].kind == SpfMx and ts[3].qualifier == SpfQuestion and ts[3].cidr4 == 24 and ts[3].cidr6 == 64)
+    test.assert(ts[3].spec == "mail.example.com")
+    test.assert(ts[4].kind == SpfPtr and ts[4].spec == "example.org")
+    test.assert(ts[5].kind == SpfExists)
+    test.assert(ts[6].kind == SpfIp4 and ts[6].cidr4 == 24 and ts[6].lo == 3221225984)
+    test.assert(ts[7].kind == SpfIp6 and ts[7].cidr6 == 32)
+    test.assert(ts[7].text == "ip6:2001:db8::/32")
+
+    test.case("names are case-insensitive and the default qualifier is +")
+    let up = terms_of("v=spf1 MX A:Example.COM ALL")
+    test.assert(up[0].kind == SpfMx and up[0].qualifier == SpfPlus)
+    test.assert(up[1].spec == "Example.COM")
+
+    test.case("the names the verdict and a log line print")
+    test.assert(spfrecord.qualifier_char(SpfPlus) == "+")
+    test.assert(spfrecord.qualifier_char(SpfMinus) == "-")
+    test.assert(spfrecord.qualifier_char(SpfTilde) == "~")
+    test.assert(spfrecord.qualifier_char(SpfQuestion) == "?")
+    test.assert(spfrecord.kind_name(SpfAll) == "all")
+    test.assert(spfrecord.kind_name(SpfInclude) == "include")
+    test.assert(spfrecord.kind_name(SpfA) == "a")
+    test.assert(spfrecord.kind_name(SpfMx) == "mx")
+    test.assert(spfrecord.kind_name(SpfPtr) == "ptr")
+    test.assert(spfrecord.kind_name(SpfIp4) == "ip4")
+    test.assert(spfrecord.kind_name(SpfIp6) == "ip6")
+    test.assert(spfrecord.kind_name(SpfExists) == "exists")
+
+@test
+fn test_the_dual_cidr_length_has_four_forms() [io]
+    let ts = terms_of("v=spf1 a/24 a//64 a/24//64 a:x.example.com//96 a:x.example.com/8 a:foo/bar.example.com")
+    test.assert(ts[0].cidr4 == 24 and ts[0].cidr6 == 128 and ts[0].spec == "")
+    test.assert(ts[1].cidr4 == 32 and ts[1].cidr6 == 64)
+    test.assert(ts[2].cidr4 == 24 and ts[2].cidr6 == 64)
+    test.assert(ts[3].cidr6 == 96 and ts[3].spec == "x.example.com")
+    test.assert(ts[4].cidr4 == 8 and ts[4].spec == "x.example.com")
+    test.case("a slash that does not begin a valid length belongs to the domain")
+    test.assert(ts[5].spec == "foo/bar.example.com")
+    test.case("a slash inside a macro does not begin a length")
+    let m = terms_of("v=spf1 a:%{d/}.example.com/24")
+    test.assert(m[0].spec == "%{d/}.example.com" and m[0].cidr4 == 24)
+
+@test
+fn test_a_record_with_a_syntax_error_is_refused() [io]
+    test.case("lengths")
+    test.assert(refused("v=spf1 a/33"))
+    test.assert(refused("v=spf1 a//129"))
+    test.assert(refused("v=spf1 a/24//"))
+    test.assert(refused("v=spf1 a/"))
+    test.assert(refused("v=spf1 a//x"))
+    test.assert(refused("v=spf1 a/x//64"))
+    test.assert(refused("v=spf1 a/024"))
+    test.assert(refused("v=spf1 a/2x"))
+    test.assert(refused("v=spf1 a/1234"))
+    test.assert(refused("v=spf1 ax"))
+    test.assert(refused("v=spf1 a:x.example.com/24/"))
+
+    test.case("shapes of the eight mechanisms")
+    test.assert(refused("v=spf1 all:x"))
+    test.assert(refused("v=spf1 all/24"))
+    test.assert(refused("v=spf1 include"))
+    test.assert(refused("v=spf1 include:"))
+    test.assert(refused("v=spf1 exists"))
+    test.assert(refused("v=spf1 ptr/24"))
+    test.assert(refused("v=spf1 ptr:bad"))
+    test.assert(refused("v=spf1 ip4"))
+    test.assert(refused("v=spf1 ip6"))
+    test.assert(refused("v=spf1 foo"))
+    test.assert(refused("v=spf1 foo:bar.example.com"))
+
+    test.case("addresses and prefixes")
+    test.assert(refused("v=spf1 ip4:300.0.0.1"))
+    test.assert(refused("v=spf1 ip4:192.0.2.0/33"))
+    test.assert(refused("v=spf1 ip4:192.0.2.0/"))
+    test.assert(refused("v=spf1 ip6:192.0.2.0"))
+    test.assert(refused("v=spf1 ip6:2001:db8::/129"))
+    test.assert(refused("v=spf1 ip6:2001:db8::/x"))
+    test.assert(refused("v=spf1 ip6:1::2::3"))
+
+    test.case("domains and macros")
+    test.assert(refused("v=spf1 a:bad"))
+    test.assert(refused("v=spf1 a:%{x}.example.com"))
+    test.assert(refused("v=spf1 include:%{d"))
+    test.assert(refused("v=spf1 a:%{r}.example.com"))
+    test.assert(refused("v=spf1 exists:a b.example.com"))
+
+@test
+fn test_modifiers() [io]
+    let r = match spfrecord.parse("v=spf1 mx redirect=_spf.example.com exp=why.%{d} foo=bar.%{d} Foo.Bar-1_x=y")
+        Ok(x)  => x
+        Err(_) =>
+            test.fail("a record with every modifier parses")
+            SpfRecord { terms: [], has_redirect: false, redirect: "", has_exp: false, exp: "" }
+    test.assert(r.has_redirect and r.redirect == "_spf.example.com")
+    test.assert(r.has_exp and r.exp == "why.%{d}")
+    test.assert(list.len(r.terms) == 1)
+
+    test.case("a record with neither modifier says so")
+    match spfrecord.parse("v=spf1 -all")
+        Ok(x)  => test.assert(x.has_redirect == false and x.has_exp == false)
+        Err(_) => test.fail("-all parses")
+
+    test.case("each of redirect and exp is allowed once")
+    test.assert(refused("v=spf1 redirect=a.example.com redirect=b.example.com"))
+    test.assert(refused("v=spf1 exp=a.example.com exp=b.example.com"))
+
+    test.case("their values are domain-specs")
+    test.assert(refused("v=spf1 redirect=bad"))
+    test.assert(refused("v=spf1 exp=bad"))
+
+    test.case("an unknown modifier's value is a macro string, and its name is a name")
+    test.assert(refused("v=spf1 foo=%{x}"))
+    test.assert(refused("v=spf1 1foo=bar"))
+    test.assert(refused("v=spf1 fo!o=bar"))
+    test.assert(refused("v=spf1 =bar"))
+
+@test
+fn test_the_faults_describe_themselves() [io]
+    test.assert(spferror.message(SpfMacro("%{x}", "no such letter")) == "the macro string `%{x}` is not valid: no such letter")
+    test.assert(spferror.code(SpfMacro("%{x}", "no such letter")) == "macro")
+    test.assert(spferror.code(SpfSyntax("a/", "x")) == "syntax")
+    test.assert(spferror.message(SpfSyntax("a/", "x")) == "the term `a/` is not valid: x")
+
+@test
+fn test_a_macro_that_never_closes_inside_a_mechanism_with_a_domain() [io]
+    test.assert(refused("v=spf1 a:%{d"))
+    test.assert(refused("v=spf1 mx:%{d"))
+
+@test
+fn test_expand_checked_is_the_expansion_without_the_check() [io]
+    test.assert(spfmacro.expand_checked("%{l}@%{d2}", env_for("192.0.2.3")) == "strong-bad@example.com")
+    test.assert(spfmacro.expand_checked("plain", env_for("192.0.2.3")) == "plain")

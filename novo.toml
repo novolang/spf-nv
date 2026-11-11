@@ -1,0 +1,44 @@
+[package]
+name        = "spf-nv"
+license     = "Apache-2.0"
+version     = "0.1.0"
+description = "Sender Policy Framework (RFC 7208) with no I/O of its own: the record grammar, the macro expansion of section 7, check_host as a step that hands the caller a DNS question and takes the answer, the lookup and void limits, the seven results with the explanation string, and the Received-SPF and Authentication-Results header fields written and read."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`.
+
+stability   = "experimental"
+
+# `core`, and every row is `[]`.  The evaluation never resolves a name:
+# `spfeval.check_host` answers either a verdict or the one DNS question
+# it cannot go on without, and the caller looks the answer up and calls
+# it again.  A caller with a DNS cache, a recorded exchange or a test
+# table uses it the same way, and the OpenSPF suite is run through that
+# step with a table.  The clock is an argument as well: `%{t}` reads a
+# number the caller supplied.
+#
+# NO DEVICE CLAIM.  A record, an answer table and a verdict are strings
+# and lists, and a microcontroller does not receive mail, so the README
+# says that no module is admitted at `@tier(embedded)` and no probe is
+# shipped.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["spf", "email", "rfc7208", "smtp", "authentication", "dns", "sender-policy-framework", "dmarc"]
+repository  = "https://github.com/novolang/spf-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Evaluate an SPF policy as a step that asks for DNS answers and takes them"
+
+[dependencies]
+# IPv4 and IPv6 parsing and the canonical text of an address, which the
+# `%{c}` macro letter and the `ip6` mechanism need.  The package is
+# `core` and has no dependencies of its own.
+ipaddr-nv = "^0.1.5"

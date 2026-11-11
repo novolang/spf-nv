@@ -1,0 +1,405 @@
+// spfheader.nv — the two header fields an SPF verdict is recorded in.
+//
+// `Received-SPF` (RFC 7208 section 9.1) is the trace field a receiver
+// prepends to the message: the result, a comment for a person, and
+// key-value pairs for a program.  `Authentication-Results` (RFC 8601
+// section 2.7.2, and RFC 7208 section 9.2) is the field a receiver
+// reports all its authentication methods in, and the SPF method is one
+// `resinfo` of it.  This module writes the value of each and reads it
+// back.
+//
+// THE VALUES ARE ONE LINE.  A header field value may be folded
+// anywhere whitespace is allowed (RFC 5322 section 2.2.3); the writer
+// produces the unfolded form and the reader accepts either, so a caller
+// folds at the width its message uses.
+//
+// NOTHING FROM THE SENDER IS TRUSTED INTO THE FIELD.  Section 9.1
+// requires that the field holds no invalid characters and none the
+// sender controls.  Every value written is a dot-atom or a quoted
+// string, and a quoted string has its quotes and backslashes escaped
+// and its control characters replaced by spaces.
+
+use spferror
+use spfeval
+
+// A parsed `Received-SPF` value: the result, the comment (without its
+// parentheses), and the key-value pairs in the order they were written
+// with the keys in lower case.
+pub struct SpfReceived
+    result: SpfResult
+    comment: Str
+    keys: [Str]
+    values: [Str]
+
+// A parsed SPF method result out of an `Authentication-Results` field:
+// the result, the comment, the optional `reason`, and the properties
+// (`smtp.mailfrom`, `smtp.helo`, ...) as lower-case keys with values.
+pub struct SpfAuthResult
+    result: SpfResult
+    comment: Str
+    reason: Str
+    keys: [Str]
+    values: [Str]
+
+// Letters, digits and the specials of RFC 5322 atext, and the colon.
+// The colon is not atext, but the RFC's own examples write
+// `mechanism=ip4:192.0.2.1` and every deployed verifier writes an IPv6
+// `client-ip` the same way, so it is not quoted.
+fn is_atext(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9'
+        or str.contains("!#$%&'*+-/=?^_`{|}~:", str.from_byte(b))
+
+// Whether a value is a dot-atom: atext separated by single dots.
+fn is_dot_atom(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0 or str.byte_at_or(s, 0, 0) == '.' or str.byte_at_or(s, n - 1, 0) == '.'
+        return false
+    var prev_dot = false
+    for k in 0..n
+        let b = str.byte_at_or(s, k, 0)
+        if b == '.'
+            if prev_dot
+                return false
+            prev_dot = true
+        elif is_atext(b)
+            prev_dot = false
+        else
+            return false
+    true
+
+// A value as a dot-atom when it is one and as a quoted string when not.
+fn word(s: Str) -> Str
+    if is_dot_atom(s)
+        return s
+    var parts: [Str] = ["\""]
+    for k in 0..str.len(s)
+        let b = str.byte_at_or(s, k, 0)
+        if b == '"' or b == '\\'
+            list.push(parts, "\\")
+            list.push(parts, str.from_byte(b))
+        elif b < 32 or b == 127
+            list.push(parts, " ")
+        else
+            list.push(parts, str.from_byte(b))
+    list.push(parts, "\"")
+    str.join(parts, "")
+
+// A property value of `Authentication-Results` (RFC 8601 section 2.2):
+// a `[local-part] @ domain` is written bare, anything else as `word`.
+fn pvalue(s: Str) -> Str
+    match str.index(s, "@")
+        None     => word(s)
+        Some(at) =>
+            let local = str.slice(s, 0, at)
+            let domain = str.slice(s, at + 1, str.len(s))
+            if (local == "" or is_dot_atom(local)) and is_dot_atom(domain)
+                s
+            else
+                word(s)
+
+// The comment text of a header field: no parentheses, backslashes or
+// control characters, whatever the sender put in the name.
+fn comment_text(s: Str) -> Str
+    var parts: [Str] = []
+    for k in 0..str.len(s)
+        let b = str.byte_at_or(s, k, 0)
+        if b == '(' or b == ')' or b == '\\' or b < 32 or b == 127
+            list.push(parts, "?")
+        else
+            list.push(parts, str.from_byte(b))
+    str.join(parts, "")
+
+fn comment_of(v: SpfVerdict, req: SpfRequest) -> Str
+    let who = req.sender
+    let ip = req.ip
+    match v.result
+        SpfPass      => "domain of ${who} designates ${ip} as permitted sender"
+        SpfFail      => "domain of ${who} does not designate ${ip} as permitted sender"
+        SpfSoftFail  => "transitioning domain of ${who} does not designate ${ip} as permitted sender"
+        SpfNeutral   => "${ip} is neither permitted nor denied by domain of ${who}"
+        SpfNone      => "${v.domain} does not publish an SPF policy"
+        SpfTempError => "error in processing during lookup of ${v.domain}"
+        SpfPermError => "domain of ${who} has an SPF policy that cannot be evaluated"
+
+// Write the value of a `Received-SPF` field (section 9.1).  `identity`
+// is `mailfrom` or `helo`; the pairs written are `receiver`,
+// `client-ip`, `envelope-from` (omitted for the HELO identity),
+// `helo`, `identity`, `mechanism` when one matched, and `problem` for
+// an error.
+//
+// ```novo
+// use spfheader
+// use spfeval
+//
+// fn main() [io]
+//     let req = spfeval.request("192.0.2.1", "alice@example.com", "mail.example.com", "mx.example.net", 0)
+//     let v = SpfVerdict { result: SpfPass, explanation: "", mechanism: "ip4:192.0.2.1",
+//                          reason: "", domain: "example.com", lookups: 0, voids: 0 }
+//     println(spfheader.received_spf(v, req, "mailfrom"))
+// ```
+pub fn received_spf(v: SpfVerdict, req: SpfRequest, identity: Str) -> Str []
+    var parts: [Str] = []
+    list.push(parts,
+        "${spfeval.result_name(v.result)} (${comment_text(req.receiver)}: ${comment_text(comment_of(v, req))})")
+    list.push(parts, " receiver=${word(req.receiver)};")
+    list.push(parts, " client-ip=${word(req.ip)};")
+    if identity != "helo"
+        list.push(parts, " envelope-from=${word(req.sender)};")
+    list.push(parts, " helo=${word(req.helo)};")
+    list.push(parts, " identity=${word(identity)};")
+    if v.mechanism != ""
+        list.push(parts, " mechanism=${word(v.mechanism)};")
+    if v.reason != ""
+        list.push(parts, " problem=${word(v.reason)};")
+    str.join(parts, "")
+
+// The result a token names, or None.
+fn result_of(token: Str) -> ?SpfResult
+    let t = str.lower(token)
+    if t == "pass"
+        Some(SpfPass)
+    elif t == "fail"
+        Some(SpfFail)
+    elif t == "softfail"
+        Some(SpfSoftFail)
+    elif t == "neutral"
+        Some(SpfNeutral)
+    elif t == "none"
+        Some(SpfNone)
+    elif t == "temperror"
+        Some(SpfTempError)
+    elif t == "permerror"
+        Some(SpfPermError)
+    else
+        None
+
+// Unfold a header value: a line break followed by whitespace is
+// whitespace.
+fn unfold(s: Str) -> Str
+    str.replace(str.replace(str.replace(s, "\r\n", ""), "\n", ""), "\t", " ")
+
+fn skip_space(s: Str, from: Int) -> Int
+    var i = from
+    while i < str.len(s) and str.byte_at_or(s, i, 0) == ' '
+        i += 1
+    i
+
+// The position just past the comment that starts at `at`, and its text
+// without the outer parentheses: nested comments and backslash escapes
+// are read as RFC 5322 section 3.2.2 has them.  The end is -1 when the
+// comment is never closed.
+struct Comment
+    end: Int
+    text: Str
+
+fn read_comment(s: Str, at: Int) -> Comment
+    var depth = 0
+    var i = at
+    var parts: [Str] = []
+    while i < str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == '\\' and i + 1 < str.len(s)
+            list.push(parts, str.from_byte(str.byte_at_or(s, i + 1, 0)))
+            i += 2
+        else
+            if b == '('
+                depth += 1
+                if depth > 1
+                    list.push(parts, "(")
+            elif b == ')'
+                depth -= 1
+                if depth == 0
+                    return Comment { end: i + 1, text: str.join(parts, "") }
+                list.push(parts, ")")
+            else
+                list.push(parts, str.from_byte(b))
+            i += 1
+    Comment { end: -1, text: "" }
+
+// A word at `at`: a quoted string (unescaped) or the run of characters
+// up to a space or `;`.  The answer is the text and the position after.
+struct Word
+    end: Int
+    text: Str
+
+fn read_word(s: Str, at: Int) -> Word
+    if str.byte_at_or(s, at, 0) == '"'
+        var parts: [Str] = []
+        var i = at + 1
+        while i < str.len(s)
+            let b = str.byte_at_or(s, i, 0)
+            if b == '\\' and i + 1 < str.len(s)
+                list.push(parts, str.from_byte(str.byte_at_or(s, i + 1, 0)))
+                i += 2
+            elif b == '"'
+                return Word { end: i + 1, text: str.join(parts, "") }
+            else
+                list.push(parts, str.from_byte(b))
+                i += 1
+        return Word { end: -1, text: "" }
+    var i = at
+    while i < str.len(s) and str.byte_at_or(s, i, 0) != ' ' and str.byte_at_or(s, i, 0) != ';'
+        i += 1
+    Word { end: i, text: str.slice(s, at, i) }
+
+fn bad(why: Str) -> SpfError
+    SpfRequest(why)
+
+// Read the value of a `Received-SPF` field.
+//
+// ```novo
+// use spfheader
+//
+// fn main() [io]
+//     match spfheader.parse_received_spf("pass (mx: ok) client-ip=192.0.2.1; helo=h;")
+//         Ok(r)  => println("${list.len(r.keys)}")     // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_received_spf(value: Str) -> Result<SpfReceived, SpfError> []
+    let s = unfold(value)
+    var i = skip_space(s, 0)
+    let first = read_word(s, i)
+    let r = match result_of(first.text)
+        None    =>
+            return Err(bad("`${first.text}` is not an SPF result"))
+        Some(x) => x
+    i = skip_space(s, first.end)
+    var comment = ""
+    if str.byte_at_or(s, i, 0) == '('
+        let c = read_comment(s, i)
+        if c.end < 0
+            return Err(bad("the comment is never closed"))
+        comment = c.text
+        i = skip_space(s, c.end)
+    var keys: [Str] = []
+    var values: [Str] = []
+    while i < str.len(s)
+        if str.byte_at_or(s, i, 0) == ';'
+            i = skip_space(s, i + 1)
+        else
+            let eq = str.index_from(s, "=", i) ?? -1
+            if eq < 0
+                return Err(bad("a key-value pair has no `=`"))
+            let key = str.lower(str.trim(str.slice(s, i, eq)))
+            if key == "" or str.contains(key, " ") or str.contains(key, ";")
+                return Err(bad("`${key}` is not a key"))
+            let w = read_word(s, skip_space(s, eq + 1))
+            if w.end < 0
+                return Err(bad("the quoted value of `${key}` is never closed"))
+            list.push(keys, key)
+            list.push(values, w.text)
+            i = skip_space(s, w.end)
+    Ok(SpfReceived { result: r, comment: comment, keys: keys, values: values })
+
+// The value of a key of a parsed `Received-SPF`, or None.
+//
+// ```novo
+// use spfheader
+//
+// fn main() [io]
+//     match spfheader.parse_received_spf("pass client-ip=192.0.2.1;")
+//         Ok(r)  => println(spfheader.received_value(r, "client-ip") ?? "")    // 192.0.2.1
+//         Err(e) => println(e.message())
+// ```
+pub fn received_value(r: SpfReceived, key: Str) -> ?Str []
+    let want = str.lower(key)
+    for k in 0..list.len(r.keys)
+        if r.keys[k] == want
+            return Some(r.values[k])
+    None
+
+// The `Authentication-Results` method result for SPF (RFC 8601 section
+// 2.7.2): `spf=pass smtp.mailfrom=alice@example.com`, with
+// `smtp.helo` as well when the HELO name is known.  A reason, when the
+// verdict has one, is written as `reason="..."`.
+//
+// ```novo
+// use spfheader
+// use spfeval
+//
+// fn main() [io]
+//     let req = spfeval.request("192.0.2.1", "alice@example.com", "mail.example.com", "mx.example.net", 0)
+//     let v = SpfVerdict { result: SpfPass, explanation: "", mechanism: "ip4:192.0.2.1",
+//                          reason: "", domain: "example.com", lookups: 0, voids: 0 }
+//     println(spfheader.authentication_results(v, req))
+//     // spf=pass smtp.mailfrom=alice@example.com smtp.helo=mail.example.com
+// ```
+pub fn authentication_results(v: SpfVerdict, req: SpfRequest) -> Str []
+    var parts: [Str] = ["spf=${spfeval.result_name(v.result)}"]
+    if v.reason != ""
+        list.push(parts, "reason=${word(v.reason)}")
+    list.push(parts, "smtp.mailfrom=${pvalue(req.sender)}")
+    if req.helo != ""
+        list.push(parts, "smtp.helo=${pvalue(req.helo)}")
+    str.join(parts, " ")
+
+// Read one SPF method result of an `Authentication-Results` value:
+// `spf=pass (comment) reason="..." smtp.mailfrom=... smtp.helo=...`.
+// The text is the method's own part, from `spf=` to the next `;`.
+//
+// ```novo
+// use spfheader
+//
+// fn main() [io]
+//     match spfheader.parse_authentication_results("spf=fail smtp.mailfrom=a@example.com")
+//         Ok(r)  => println(spfheader.auth_value(r, "smtp.mailfrom") ?? "")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_authentication_results(text: Str) -> Result<SpfAuthResult, SpfError> []
+    let s = unfold(text)
+    var i = skip_space(s, 0)
+    if str.lower(str.slice(s, i, i + 4)) != "spf="
+        return Err(bad("the method is not `spf`"))
+    let first = read_word(s, i + 4)
+    let r = match result_of(first.text)
+        None    =>
+            return Err(bad("`${first.text}` is not an SPF result"))
+        Some(x) => x
+    i = skip_space(s, first.end)
+    var comment = ""
+    if str.byte_at_or(s, i, 0) == '('
+        let c = read_comment(s, i)
+        if c.end < 0
+            return Err(bad("the comment is never closed"))
+        comment = c.text
+        i = skip_space(s, c.end)
+    var reason = ""
+    var keys: [Str] = []
+    var values: [Str] = []
+    while i < str.len(s) and str.byte_at_or(s, i, 0) != ';'
+        let eq = str.index_from(s, "=", i) ?? -1
+        if eq < 0
+            return Err(bad("a property has no `=`"))
+        let key = str.lower(str.trim(str.slice(s, i, eq)))
+        let w = read_word(s, skip_space(s, eq + 1))
+        if w.end < 0
+            return Err(bad("the quoted value of `${key}` is never closed"))
+        if key == "reason"
+            reason = w.text
+        else
+            list.push(keys, key)
+            list.push(values, w.text)
+        i = skip_space(s, w.end)
+        if str.byte_at_or(s, i, 0) == '('
+            let c = read_comment(s, i)
+            if c.end < 0
+                return Err(bad("the comment is never closed"))
+            i = skip_space(s, c.end)
+    Ok(SpfAuthResult { result: r, comment: comment, reason: reason, keys: keys, values: values })
+
+// The value of a property of a parsed SPF method result, or None.
+//
+// ```novo
+// use spfheader
+//
+// fn main() [io]
+//     match spfheader.parse_authentication_results("spf=pass smtp.helo=h.example")
+//         Ok(r)  => println(spfheader.auth_value(r, "smtp.helo") ?? "")    // h.example
+//         Err(e) => println(e.message())
+// ```
+pub fn auth_value(r: SpfAuthResult, key: Str) -> ?Str []
+    let want = str.lower(key)
+    for k in 0..list.len(r.keys)
+        if r.keys[k] == want
+            return Some(r.values[k])
+    None
